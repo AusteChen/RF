@@ -104,7 +104,7 @@ class Trainer:
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
         if getattr(config, "generator_ckpt", False):
             print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")[
+            state_dict = torch.load(config.generator_ckpt, map_location="cpu", weights_only=False)[
                 'generator']
             self.model.generator.load_state_dict(
                 state_dict, strict=True

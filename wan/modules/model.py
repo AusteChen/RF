@@ -82,6 +82,9 @@ class WanRMSNorm(nn.Module):
         """
         return self._norm(x.float()).type_as(x) * self.weight
 
+    def reset_parameters(self):
+        nn.init.ones_(self.weight)
+
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 

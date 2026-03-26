@@ -1,0 +1,77 @@
+generator_ckpt: /home/adminad/GaoyanTian/model/wan1_3b_ptver/model.pt
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.1-T2V-1.3B
+text_encoder_fsdp_wrap_strategy: size
+denoising_step_list:
+- 1000
+- 800
+- 600
+- 400
+- 200
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+seed: 28
+sharding_strategy: hybrid_full
+lr: 5.0e-07
+lr_critic: 5.0e-08
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+
+data_path: /home/adminad/GaoyanTian/data/prompts/vidprom_filtered_extended.txt
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 8
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+image_or_video_shape:
+- 1
+- 21
+- 16
+- 60
+- 104
+distribution_loss: dmd
+trainer: score_distillation
+gradient_checkpointing: true
+num_frame_per_block: 3
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  # V2 架构参数
+  use_dual_channel_head: false
+  use_gumbel_router: false
+  compression_ratio: 4
+  # global_layer_indices: [0, 5, 10, 15]  # 可选，硬编码特定层为全局层
+
+# ========================================
+# 课程式学习 (Curriculum Learning) 配置
+# ========================================
+use_curriculum: true
+transition_steps: 2000
+decay_mode: linear
+
+# ========================================
+# 训练控制配置
+# ========================================
+max_steps: 6000  # 训练到指定 step 停止，设为 0 或不设置则不限制
+
+# ========================================
+# WandB 日志配置
+# ========================================
+log_iters: 100
+save_interval: 500
+wandb_host: "https://api.wandb.ai"
+wandb_key: "5073de302aacc34eff42c5304b125048337ec363"
+wandb_entity: auste_t
+wandb_project: rolling_forcing
+wandb_name: exp1
+

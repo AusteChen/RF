@@ -104,20 +104,14 @@ class RollingForcingModel(BaseModel):
         self,
         image_or_video_shape,
         conditional_dict: dict,
-        initial_latent: torch.tensor = None
+        initial_latent: torch.tensor = None,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Optionally simulate the generator's input from noise using backward simulation
-        and then run the generator for one-step.
-        Input:
-            - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
-            - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
-            - initial_latent: a tensor containing the initial latents [B, F, C, H, W].
-        Output:
-            - pred_image: a tensor with shape [B, F, C, H, W].
-            - denoised_timestep: an integer
+        新增参数:
+            lookahead_blocks: 课程式 mask 的 lookahead 窗口大小
+            force_update_mask: 是否强制更新 block mask
         """
         # Step 1: Sample noise and backward simulate the generator's input
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
@@ -149,6 +143,8 @@ class RollingForcingModel(BaseModel):
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape,
                               device=self.device, dtype=self.dtype),
+            lookahead_blocks=lookahead_blocks,
+            force_update_mask=force_update_mask,
             **conditional_dict,
         )
         # Slice last 21 frames
@@ -182,6 +178,8 @@ class RollingForcingModel(BaseModel):
     def _consistency_backward_simulation(
         self,
         noise: torch.Tensor,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False,
         **conditional_dict: dict
     ) -> torch.Tensor:
         """
@@ -204,11 +202,15 @@ class RollingForcingModel(BaseModel):
 
         if infer_w_rolling:
             return self.inference_pipeline.inference_with_rolling_forcing(
-                noise=noise, **conditional_dict
+                noise=noise, **conditional_dict,
+                lookahead_blocks=lookahead_blocks,
+                force_update_mask=force_update_mask
             )
         else:
             return self.inference_pipeline.inference_with_self_forcing(
-                noise=noise, **conditional_dict
+                noise=noise, **conditional_dict,
+                lookahead_blocks=lookahead_blocks,
+                force_update_mask=force_update_mask
             )
 
     def _initialize_inference_pipeline(self):

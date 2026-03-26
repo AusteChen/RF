@@ -14,6 +14,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 import math
 import torch.distributed as dist
 
@@ -55,6 +56,278 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     return torch.stack(output).type_as(x)
 
 
+# ========================================
+# 新增：课程式 Mask 调度器
+# ========================================
+
+class CausalTransitionScheduler:
+    """
+    课程式 Mask 调度器：从全双向逐步过渡到全因果
+
+    训练初期：允许模型看到更多未来帧（Bidirectional）
+    训练后期：逐步减少直到完全因果（Causal）
+
+    这是一种课程式学习策略，让模型从易到难学习时序建模。
+    """
+
+    def __init__(
+        self,
+        total_steps: int,
+        num_frames: int,
+        start_step: int = 0,
+        decay_mode: str = 'linear'
+    ):
+        """
+        Args:
+            total_steps (int): 总训练步数
+            num_frames (int): 视频的总帧数
+            start_step (int): 从多少步开始衰减（前几步保持全双向作为Warmup）
+            decay_mode (str): 'linear' 或 'cosine'
+        """
+        self.total_steps = total_steps
+        self.num_frames = num_frames
+        self.start_step = start_step
+        self.decay_mode = decay_mode
+
+    def get_lookahead_window(self, current_step: int) -> int:
+        """
+        计算当前允许看未来的帧数 k
+        k = num_frames -> 全双向 (Bidirectional)
+        k = 0 -> 全因果 (Causal)
+        """
+        if current_step < self.start_step:
+            return self.num_frames  # Warmup期保持全双向
+
+        denominator = self.total_steps - self.start_step
+        if denominator <= 0:
+            progress = 1.0
+        else:
+            progress = (current_step - self.start_step) / denominator
+        progress = max(0.0, min(1.0, progress))
+
+        if self.decay_mode == 'linear':
+            k = int(self.num_frames * (1 - progress))
+        elif self.decay_mode == 'cosine':
+            k = int(self.num_frames * 0.5 * (1 + math.cos(progress * math.pi)))
+        else:
+            raise ValueError(f"Unknown decay mode: {self.decay_mode}")
+
+        return max(0, k)
+
+
+# ========================================
+# 新增：Gumbel-Softmax 门控路由器
+# ========================================
+
+class LayerRouter(nn.Module):
+    """
+    Gumbel-Softmax 门控路由器 (单层独立版)
+
+    推荐用法：在 CausalAttention 或 TransformerBlock 的 __init__ 中实例化本类。
+    每一层独立维护自己的可学习路由概率。
+    """
+
+    def __init__(self, init_global_prob: float = 0.8):
+        super().__init__()
+        # 使用两个标量参数代表 [local_logit, global_logit]
+        # 初始时给予偏向全局层的概率
+        init_local = math.log(1.0 - init_global_prob + 1e-8)
+        init_global = math.log(init_global_prob + 1e-8)
+
+        # 将其注册为当前层的可学习参数
+        self.routing_logits = nn.Parameter(torch.tensor([init_local, init_global]))
+
+    def reset_parameters(self):
+        """重置路由 logits 为初始值，确保与 PyTorch FSDP 兼容"""
+        init_local = math.log(1.0 - 0.8 + 1e-8)  # 默认 0.8 全局概率
+        init_global = math.log(0.8 + 1e-8)
+        with torch.no_grad():
+            self.routing_logits.copy_(torch.tensor([init_local, init_global]))
+
+    def forward(self, temperature: float = 1.0) -> torch.Tensor:
+        """
+        前向传播：直接输出这一层是否为全局层的确切决策（标量）。
+
+        Args:
+            temperature: Gumbel-Softmax 退火温度。
+
+        Returns:
+            is_global: 标量张量 (1.0 代表全局层，0.0 代表局部层)
+        """
+        if self.training:
+            # 官方底层的 Gumbel Softmax。自带噪声与 STE (hard=True)
+            # 输出类似 [0.0, 1.0] 的 one-hot 向量
+            routing_weights = F.gumbel_softmax(
+                self.routing_logits,
+                tau=temperature,
+                hard=True,
+                dim=0
+            )
+        else:
+            # 推理阶段：直接选 logits 最大的那个作为 one-hot 向量
+            routing_weights = F.one_hot(torch.argmax(self.routing_logits, dim=0), num_classes=2).float()
+
+        # 索引 1 代表全局层
+        is_global = routing_weights[1]
+
+        return is_global
+
+
+# ========================================
+# 新增：双通道历史信息提取头
+# ========================================
+
+class DualChannelExtractionHead(nn.Module):
+    """
+    双通道历史信息提取头 (流式生成专用)
+
+    通道一：基于余弦相似度检测场景切换，动态更新 1-2 帧局部锚点。
+    通道二：将滑出窗口的废弃特征 (evicted) 进行空间池化降维，拼接到定长队列中。
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        memory_size: int = 100,      # 固定长度的记忆队列容量
+        anchor_frames: int = 2,      # 动态锚点保留的帧数
+        scene_change_tau: float = 0.6, # 场景切换的相似度阈值
+        compression_ratio: int = 4,  # 空间下采样率 (如 4 代表 2x2 池化)
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.memory_size = memory_size
+        self.anchor_frames = anchor_frames
+        self.scene_change_tau = scene_change_tau
+        self.compression_ratio = compression_ratio
+
+        # 动态状态（不使用 Parameter，因为形状受 Batch 影响且随时间增长）
+        # 在 forward 中动态初始化
+        self.memory_k = None
+        self.memory_v = None
+        self.last_frame_key = None
+
+    def reset_parameters(self):
+        """重置动态状态，确保与 PyTorch FSDP 兼容"""
+        # 动态状态不需要参数初始化，但需要重置为 None
+        self.memory_k = None
+        self.memory_v = None
+        self.last_frame_key = None
+
+    def forward(
+        self,
+        current_k: torch.Tensor,   # [B, S_curr, N, D] 当前窗口的 K
+        current_v: torch.Tensor,   # [B, S_curr, N, D] 当前窗口的 V
+        evicted_k: torch.Tensor,   # [B, S_evict, N, D] 滑出窗口即将被丢弃的 K (可能为 None)
+        evicted_v: torch.Tensor,   # [B, S_evict, N, D] 滑出窗口即将被丢弃的 V (可能为 None)
+        is_global_layer: bool,     # 标量布尔值：当前是否是全局层
+        spatial_shape: tuple,      # (H, W) 当前特征图的空间分辨率
+    ) -> dict:
+
+        B, S_curr, N, D = current_k.shape
+        output = {
+            'anchor_k': None,
+            'anchor_v': None,
+            'memory_k': None,
+            'memory_v': None,
+            'is_scene_change': False,
+        }
+
+        # ==========================================
+        # 通道一：动态锚点流 (检测当前窗口的场景变化)
+        # ==========================================
+        # 获取当前窗口最后一帧的平均特征表示 [B, D]
+        current_frame_repr = current_k[:, -1, :, :].mean(dim=1)
+
+        if self.last_frame_key is not None:
+            # 计算余弦相似度
+            current_norm = F.normalize(current_frame_repr, dim=-1)
+            last_norm = F.normalize(self.last_frame_key, dim=-1)
+            similarity = (current_norm * last_norm).sum(dim=-1).mean().item()
+
+            is_scene_change = similarity < self.scene_change_tau
+        else:
+            is_scene_change = True  # 第一帧强制视为场景切换
+
+        self.last_frame_key = current_frame_repr.detach()
+        output['is_scene_change'] = is_scene_change
+
+        if is_scene_change:
+            # 截取当前窗口最初的几帧作为新的动态锚点
+            output['anchor_k'] = current_k[:, :self.anchor_frames, :, :]
+            output['anchor_v'] = current_v[:, :self.anchor_frames, :, :]
+
+        # ==========================================
+        # 通道二：增量压缩历史流 (仅全局层工作，仅处理 evicted)
+        # ==========================================
+        if is_global_layer and evicted_k is not None and evicted_k.shape[1] > 0:
+
+            # 1. 空间池化压缩
+            compressed_k = self._spatial_pool(evicted_k, spatial_shape)
+            compressed_v = self._spatial_pool(evicted_v, spatial_shape)
+
+            # 2. 追加到记忆队列
+            if self.memory_k is None:
+                self.memory_k = compressed_k.detach()
+                self.memory_v = compressed_v.detach()
+            else:
+                self.memory_k = torch.cat([self.memory_k, compressed_k.detach()], dim=1)
+                self.memory_v = torch.cat([self.memory_v, compressed_v.detach()], dim=1)
+
+            # 3. 定长 FIFO 截断 (避免 OOM)
+            if self.memory_k.shape[1] > self.memory_size:
+                self.memory_k = self.memory_k[:, -self.memory_size:, :, :]
+                self.memory_v = self.memory_v[:, -self.memory_size:, :, :]
+
+            output['memory_k'] = self.memory_k
+            output['memory_v'] = self.memory_v
+
+        return output
+
+    def _spatial_pool(self, x: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
+        """安全的空间 2D 池化，保持时间维度不变"""
+        B, S, N, D = x.shape
+        H, W = spatial_shape
+        T = S // (H * W)
+
+        # 兜底：如果序列中包含特殊 token 导致无法整除，直接对序列长度进行 1D 降维
+        if S % (H * W) != 0:
+            target_S = max(1, S // self.compression_ratio)
+            # x 变成 [B*N, D, S] 进行 1D 均值池化
+            x_pool = F.adaptive_avg_pool1d(x.permute(0, 2, 3, 1).reshape(B * N, D, S), target_S)
+            return x_pool.reshape(B, N, D, target_S).permute(0, 3, 1, 2)
+
+        # 还原回空间结构: [B, T, H, W, N, D]
+        x = x.reshape(B, T, H, W, N, D)
+
+        # 在 H, W 维度上进行 2D 池化
+        if H >= self.compression_ratio and W >= self.compression_ratio:
+            h_pool = H // self.compression_ratio
+            w_pool = W // self.compression_ratio
+            x = x.permute(0, 1, 4, 2, 3, 5).reshape(B * T * N, 1, H, W)
+            x = F.avg_pool2d(x, kernel_size=(self.compression_ratio, self.compression_ratio),
+                             stride=(self.compression_ratio, self.compression_ratio))
+            x = x.reshape(B, T, N, h_pool, w_pool, D).permute(0, 1, 3, 4, 2, 5)
+        else:
+            # H 或 W 比 compression_ratio 小时，直接用 1D 池化
+            target_S = max(1, S // self.compression_ratio)
+            x_pool = F.adaptive_avg_pool1d(x.permute(0, 2, 3, 1).reshape(B * N, D, S), target_S)
+            x = x_pool.reshape(B, N, target_S, D).permute(0, 2, 1, 3)
+
+        # 重新展平为 [B, S', N, D]
+        S_new = x.shape[1] * x.shape[2] * x.shape[3]
+        return x.reshape(B, S_new, N, D)
+
+    def reset(self):
+        """重置动态状态"""
+        self.memory_k = None
+        self.memory_v = None
+        self.last_frame_key = None
+
+
 class CausalWanSelfAttention(nn.Module):
 
     def __init__(self,
@@ -94,7 +367,9 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache=None,
         current_start=0,
         cache_start=None,
-        updating_cache=False
+        updating_cache=False,
+        extra_k=None,   # [B, S_extra, N, D]  来自 DualChannelExtractionHead 的附加 K（仅推理 kv_cache 分支）
+        extra_v=None,   # [B, S_extra, N, D]  来自 DualChannelExtractionHead 的附加 V（仅推理 kv_cache 分支）
     ):
         r"""
         Args:
@@ -103,6 +378,8 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
+            extra_k/extra_v: 可选的附加历史 KV（由 DualChannelExtractionHead 提供），
+                             仅在 kv_cache 推理分支中拼接到 anchor + working cache 之前。
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -280,18 +557,19 @@ class CausalWanSelfAttention(nn.Module):
                         kv_cache["k"][:, :self.block_length], grid_sizes_one_block, freqs, start_frame=rope_start_frame).type_as(v)
                     anchor_cache_v = kv_cache["v"][:, :self.block_length]
 
-                    # 3. attention with working cache and anchor cache
-                    input_key = torch.cat([
-                        anchor_cache_key,
-                        working_cache_key,
-                        roped_key
-                    ], dim=1)
+                    # 3. 组装 key/value，按顺序：
+                    #    [extra(双通道历史)] + [anchor(第一块)] + [working cache] + [current]
+                    #    extra_k/v 来自 DualChannelExtractionHead，仅当传入时拼接
+                    key_parts = []
+                    v_parts = []
+                    if extra_k is not None and extra_v is not None:
+                        key_parts.append(extra_k)
+                        v_parts.append(extra_v)
+                    key_parts += [anchor_cache_key, working_cache_key, roped_key]
+                    v_parts   += [anchor_cache_v,   working_cache_v,   v]
 
-                    input_v = torch.cat([
-                        anchor_cache_v,
-                        working_cache_v,
-                        v
-                    ], dim=1)
+                    input_key = torch.cat(key_parts, dim=1)
+                    input_v   = torch.cat(v_parts,   dim=1)
 
                     x = attention(
                         roped_query,
@@ -317,7 +595,12 @@ class CausalWanAttentionBlock(nn.Module):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=False,
-                 eps=1e-6):
+                 eps=1e-6,
+                 # 新增参数
+                 is_global_layer=None,
+                 use_dual_channel_head=False,
+                 compression_ratio=4,
+                 ):
         super().__init__()
         self.dim = dim
         self.ffn_dim = ffn_dim
@@ -326,6 +609,23 @@ class CausalWanAttentionBlock(nn.Module):
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
+
+        # 新增参数
+        self.is_global_layer = is_global_layer
+        self.use_dual_channel_head = use_dual_channel_head
+        self.compression_ratio = compression_ratio
+
+        # 双通道历史信息提取头
+        if use_dual_channel_head:
+            head_dim = dim // num_heads
+            self.dual_channel_head = DualChannelExtractionHead(
+                dim=dim,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                compression_ratio=compression_ratio,
+            )
+        else:
+            self.dual_channel_head = None
 
         # layers
         self.norm1 = WanLayerNorm(dim, eps)
@@ -346,6 +646,15 @@ class CausalWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
+    def reset_parameters(self):
+        """重置所有可学习参数，确保与 PyTorch FSDP 兼容"""
+        # 重置 modulation 参数
+        nn.init.normal_(self.modulation, std=1.0 / self.dim**0.5)
+        # 递归重置所有子模块
+        for module in self.children():
+            if hasattr(module, 'reset_parameters'):
+                module.reset_parameters()
+
     def forward(
         self,
         x,
@@ -360,7 +669,8 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        layer_router=None,   # 可选的 LayerRouter 实例（由 CausalWanModel 的 block loop 传入）
     ):
         r"""
         Args:
@@ -369,23 +679,77 @@ class CausalWanAttentionBlock(nn.Module):
             seq_lens(Tensor): Shape [B], length of each sequence in batch
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            layer_router: 可选 LayerRouter；若传入则用动态路由决策覆盖 is_global_layer。
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
-        # assert e.dtype == torch.float32
-        # with amp.autocast(dtype=torch.float32):
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
-        # assert e[0].dtype == torch.float32
 
-        # self-attention
+        # -------------------------------------------------------
+        # 1. 决定本层是否为全局层
+        #    优先级：layer_router（动态）> is_global_layer（硬编码）> 默认全局
+        # -------------------------------------------------------
+        if layer_router is not None:
+            is_global = layer_router()          # 标量 Tensor: 1.0=全局, 0.0=局部
+            is_global_bool = is_global.item() > 0.5
+        elif self.is_global_layer is not None:
+            is_global_bool = self.is_global_layer
+        else:
+            is_global_bool = True               # 未指定时默认全局
+
+        # -------------------------------------------------------
+        # 2. 双通道历史信息提取（仅推理 kv_cache 路径，且非 updating_cache 时）
+        # -------------------------------------------------------
+        extra_k, extra_v = None, None
+        if self.dual_channel_head is not None and kv_cache is not None and not updating_cache:
+            b, s_total = x.shape[:2]
+            n, d = self.num_heads, self.dim // self.num_heads
+            # 先对 x 做 norm+modulation 得到与 self_attn 一致的输入
+            normed_x = (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                        * (1 + e[1]) + e[0]).flatten(1, 2)
+            curr_k = self.self_attn.norm_k(self.self_attn.k(normed_x)).view(b, s_total, n, d)
+            curr_v = self.self_attn.v(normed_x).view(b, s_total, n, d)
+
+            # evicted KV 由 kv_cache 中可选字段传入（需要上层写入；若未写入则为 None）
+            evicted_k = kv_cache.get("evicted_k", None) if isinstance(kv_cache, dict) else None
+            evicted_v = kv_cache.get("evicted_v", None) if isinstance(kv_cache, dict) else None
+
+            H = grid_sizes[0][1].item()
+            W = grid_sizes[0][2].item()
+            head_out = self.dual_channel_head(
+                current_k=curr_k,
+                current_v=curr_v,
+                evicted_k=evicted_k,
+                evicted_v=evicted_v,
+                is_global_layer=is_global_bool,
+                spatial_shape=(H, W),
+            )
+
+            parts_k, parts_v = [], []
+            if head_out["anchor_k"] is not None:
+                parts_k.append(head_out["anchor_k"])
+                parts_v.append(head_out["anchor_v"])
+            if head_out["memory_k"] is not None:
+                parts_k.append(head_out["memory_k"])
+                parts_v.append(head_out["memory_v"])
+            if parts_k:
+                extra_k = torch.cat(parts_k, dim=1)
+                extra_v = torch.cat(parts_v, dim=1)
+
+        # -------------------------------------------------------
+        # 3. Self-attention（传入 extra_k/v）
+        # -------------------------------------------------------
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
-            freqs, block_mask, kv_cache, current_start, cache_start, updating_cache=updating_cache)
+            freqs, block_mask, kv_cache, current_start, cache_start,
+            updating_cache=updating_cache,
+            extra_k=extra_k,
+            extra_v=extra_v,
+        )
 
-        # with amp.autocast(dtype=torch.float32):
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
 
-        # cross-attention & ffn function
+        # cross-attention & ffn
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
             x = x + self.cross_attn(self.norm3(x), context,
                                     context_lens, crossattn_cache=crossattn_cache)
@@ -418,6 +782,15 @@ class CausalHead(nn.Module):
 
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 2, dim) / dim**0.5)
+
+    def reset_parameters(self):
+        """重置所有可学习参数，确保与 PyTorch FSDP 兼容"""
+        # 重置线性层
+        nn.init.xavier_uniform_(self.head.weight)
+        if self.head.bias is not None:
+            nn.init.zeros_(self.head.bias)
+        # 重置 modulation 参数
+        nn.init.normal_(self.modulation, std=1.0 / self.dim**0.5)
 
     def forward(self, x, e):
         r"""
@@ -461,7 +834,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
-                 eps=1e-6):
+                 eps=1e-6,
+                 # 新增参数
+                 use_dual_channel_head=False,
+                 use_gumbel_router=False,
+                 compression_ratio=4,
+                 global_layer_indices=None,  # None表示所有层为全局层
+                 use_curriculum_mask=False,
+                 curriculum_total_steps=100000,
+                 curriculum_start_step=5000,
+                 curriculum_decay_mode='linear',
+                 ):
         r"""
         Initialize the diffusion model backbone.
 
@@ -498,6 +881,22 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 Enable cross-attention normalization
             eps (`float`, *optional*, defaults to 1e-6):
                 Epsilon value for normalization layers
+            use_dual_channel_head (`bool`, *optional*, defaults to False):
+                是否使用双通道历史信息提取头
+            use_gumbel_router (`bool`, *optional*, defaults to False):
+                是否使用 Gumbel-Softmax 门控路由器
+            compression_ratio (`int`, *optional*, defaults to 4):
+                历史信息压缩比
+            global_layer_indices (`list`, *optional*, defaults to None):
+                特定的全局层索引列表（None表示所有层为全局层）
+            use_curriculum_mask (`bool`, *optional*, defaults to False):
+                是否使用课程式 mask（从全双向逐步过渡到全因果）
+            curriculum_total_steps (`int`, *optional*, defaults to 100000):
+                课程式学习的总步数
+            curriculum_start_step (`int`, *optional*, defaults to 5000):
+                课程式学习开始衰减的步数
+            curriculum_decay_mode (`str`, *optional*, defaults to 'linear'):
+                课程式学习衰减模式：'linear' 或 'cosine'
         """
 
         super().__init__()
@@ -520,6 +919,35 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps
 
+        # 新增参数
+        self.use_dual_channel_head = use_dual_channel_head
+        self.use_gumbel_router = use_gumbel_router
+        self.compression_ratio = compression_ratio
+
+        # 处理全局层索引
+        # 逻辑：
+        # 1. use_gumbel_router=true → 路由器自行判断，不预先设置 global_layer_indices
+        # 2. use_gumbel_router=false + global_layer_indices=[...] → 按 global_layer_indices 硬编码
+        # 3. use_gumbel_router=false + global_layer_indices=None → 所有层为全局层
+        if use_gumbel_router:
+            # 路由器模式：不预设 global_layer_indices，让路由器自行判断
+            self.global_layer_indices = None
+        elif global_layer_indices is not None:
+            # 硬编码模式：按 global_layer_indices 设置
+            self.global_layer_indices = sorted(list(set(global_layer_indices)))
+        else:
+            # 默认模式：所有层都为全局层
+            self.global_layer_indices = list(range(num_layers))
+
+        # 课程式 Mask 调度器
+        self.use_curriculum_mask = use_curriculum_mask
+        self.curriculum_scheduler = None
+        if use_curriculum_mask:
+            self.curriculum_total_steps = curriculum_total_steps
+            self.curriculum_start_step = curriculum_start_step
+            self.curriculum_decay_mode = curriculum_decay_mode
+            self.curriculum_num_frames = None  # 在 forward 时设置
+
         # embeddings
         self.patch_embedding = nn.Conv3d(
             in_dim, dim, kernel_size=patch_size, stride=patch_size)
@@ -534,11 +962,37 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # blocks
         cross_attn_type = 't2v_cross_attn' if model_type == 't2v' else 'i2v_cross_attn'
-        self.blocks = nn.ModuleList([
-            CausalWanAttentionBlock(cross_attn_type, dim, ffn_dim, num_heads,
-                                    local_attn_size, sink_size, qk_norm, cross_attn_norm, eps)
-            for _ in range(num_layers)
-        ])
+
+        # 如果使用 Gumbel Router 或双通道头，需要为每个 block 添加这些模块
+        self.blocks = nn.ModuleList([])
+        self.layer_routers = nn.ModuleList([]) if use_gumbel_router else None
+
+        for layer_idx in range(num_layers):
+            # 确定该层是否为全局层：
+            # - use_gumbel_router=true: 由路由器自行判断，is_global_layer=None
+            # - use_gumbel_router=false: 使用预设的 global_layer_indices
+            if use_gumbel_router:
+                is_global_layer = None  # 路由器自行判断
+            else:
+                is_global_layer = layer_idx in self.global_layer_indices
+
+            block = CausalWanAttentionBlock(
+                cross_attn_type, dim, ffn_dim, num_heads,
+                local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
+                is_global_layer=is_global_layer,
+                use_dual_channel_head=use_dual_channel_head,
+                compression_ratio=compression_ratio,
+            )
+            self.blocks.append(block)
+
+            # 为每一层添加 Gumbel Router
+            if use_gumbel_router:
+                router = LayerRouter(init_global_prob=0.8)
+                self.layer_routers.append(router)
+
+        # 课程式 mask 调度器初始化（会在 forward 时根据帧数设置）
+        if use_curriculum_mask:
+            self.curriculum_scheduler = None  # 会在 forward 时初始化
 
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
@@ -776,6 +1230,67 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         return block_mask
 
+    @staticmethod
+    def _prepare_blockwise_causal_attn_mask_with_lookahead(
+        device: torch.device | str, num_frames: int = 21,
+        frame_seqlen: int = 1560, num_frame_per_block: int = 1,
+        lookahead_blocks: int = 0, local_attn_size: int = -1
+    ):
+        """
+        课程式 lookahead mask：在标准块因果 mask 基础上，允许每个 query block
+        额外向前看 lookahead_blocks 个块的内容。
+
+        lookahead_blocks == 0  → 等同于纯因果 mask（同 _prepare_blockwise_causal_attn_mask）
+        lookahead_blocks >= num_blocks → 完全双向 mask
+
+        实现思路：
+          对于 block i（其 query token 范围是 [i*B, (i+1)*B)），
+          标准因果 mask 允许它 attend 到 kv_idx < (i+1)*B 的所有 token。
+          加了 lookahead_blocks=k 之后，允许它额外 attend 到
+          kv_idx < (i+1+k)*B 的 token（但不超过 total_length）。
+        """
+        total_length = num_frames * frame_seqlen
+        block_len = frame_seqlen * num_frame_per_block
+        num_blocks = math.ceil(total_length / block_len)
+
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        # causal_end[i] = block i 在纯因果下能看到的最大 kv 位置（exclusive）
+        # lookahead_end[i] = block i 加了 lookahead 后能看到的最大 kv 位置（exclusive）
+        causal_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+        lookahead_ends = torch.zeros(total_length + padded_length, device=device, dtype=torch.long)
+
+        for block_i in range(num_blocks):
+            q_start = block_i * block_len
+            q_end = min((block_i + 1) * block_len, total_length)
+            c_end = min((block_i + 1) * block_len, total_length)
+            la_end = min((block_i + 1 + lookahead_blocks) * block_len, total_length)
+            causal_ends[q_start:q_end] = c_end
+            lookahead_ends[q_start:q_end] = la_end
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            if local_attn_size == -1:
+                return (kv_idx < lookahead_ends[q_idx]) | (q_idx == kv_idx)
+            else:
+                # 局部窗口从因果边界往前数，不受 lookahead 影响（lookahead 额外开放）
+                local_ok = (kv_idx < causal_ends[q_idx]) & \
+                            (kv_idx >= (causal_ends[q_idx] - local_attn_size * frame_seqlen))
+                lookahead_ok = (kv_idx >= causal_ends[q_idx]) & (kv_idx < lookahead_ends[q_idx])
+                return local_ok | lookahead_ok | (q_idx == kv_idx)
+
+        block_mask = create_block_mask(
+            attention_mask, B=None, H=None,
+            Q_LEN=total_length + padded_length,
+            KV_LEN=total_length + padded_length,
+            _compile=False, device=device
+        )
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f" [Curriculum] lookahead mask: num_frames={num_frames}, "
+                  f"num_frame_per_block={num_frame_per_block}, lookahead_blocks={lookahead_blocks}")
+
+        return block_mask
+
     def _forward_inference(
         self,
         x,
@@ -789,6 +1304,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         crossattn_cache: dict = None,
         current_start: int = 0,
         cache_start: int = 0,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -873,23 +1390,33 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             updating_cache=updating_cache,
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
+        def create_custom_forward(module, block_kwargs):
+            def custom_forward(x):
+                return module(x, **block_kwargs)
             return custom_forward
 
         for block_index, block in enumerate(self.blocks):
+            # 获取本层对应的 router（如果启用了 Gumbel Router）
+            router = self.layer_routers[block_index] if self.layer_routers is not None else None
+
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start
-                    }
+                block_kwargs = dict(
+                    e=e0,
+                    seq_lens=seq_lens,
+                    grid_sizes=grid_sizes,
+                    freqs=self.freqs,
+                    context=context,
+                    context_lens=context_lens,
+                    block_mask=self.block_mask,
+                    updating_cache=updating_cache,
+                    kv_cache=kv_cache[block_index],
+                    current_start=current_start,
+                    cache_start=cache_start,
+                    layer_router=router,
                 )
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
+                    create_custom_forward(block, block_kwargs),
+                    x,
                     use_reentrant=False,
                 )
             else:
@@ -898,7 +1425,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "kv_cache": kv_cache[block_index],
                         "crossattn_cache": crossattn_cache[block_index],
                         "current_start": current_start,
-                        "cache_start": cache_start
+                        "cache_start": cache_start,
+                        "layer_router": router,
                     }
                 )
                 x = block(x, **kwargs)
@@ -919,6 +1447,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False,
     ):
         r"""
         Forward pass through the diffusion model
@@ -949,31 +1479,49 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             self.freqs = self.freqs.to(device)
 
         # Construct blockwise causal attn mask
-        if self.block_mask is None:
+        # 课程式 lookahead：当 force_update_mask=True 时，每步都重新生成 mask（lookahead 在变化）。
+        # lookahead_blocks==0 且 block_mask 已有缓存时，直接复用缓存（纯因果阶段）。
+        frame_seqlen_val = x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2])
+        num_frames_val = x.shape[2]
+        need_rebuild = (self.block_mask is None) or \
+                       (force_update_mask and lookahead_blocks != getattr(self, '_cached_lookahead', -1))
+
+        if need_rebuild:
             if clean_x is not None:
                 if self.independent_first_frame:
                     raise NotImplementedError()
                 else:
                     self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames_val,
+                        frame_seqlen=frame_seqlen_val,
                         num_frame_per_block=self.num_frame_per_block
                     )
             else:
                 if self.independent_first_frame:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames_val,
+                        frame_seqlen=frame_seqlen_val,
                         num_frame_per_block=self.num_frame_per_block,
+                        local_attn_size=self.local_attn_size
+                    )
+                elif lookahead_blocks > 0:
+                    # 课程式 mask：允许向前看 lookahead_blocks 个块
+                    self.block_mask = self._prepare_blockwise_causal_attn_mask_with_lookahead(
+                        device, num_frames=num_frames_val,
+                        frame_seqlen=frame_seqlen_val,
+                        num_frame_per_block=self.num_frame_per_block,
+                        lookahead_blocks=lookahead_blocks,
                         local_attn_size=self.local_attn_size
                     )
                 else:
                     self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
+                        device, num_frames=num_frames_val,
+                        frame_seqlen=frame_seqlen_val,
                         num_frame_per_block=self.num_frame_per_block,
                         local_attn_size=self.local_attn_size
                     )
+            # 缓存当前 lookahead 值，避免 lookahead 没变时重复构建
+            self._cached_lookahead = lookahead_blocks
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -1047,15 +1595,16 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 return module(*inputs, **kwargs)
             return custom_forward
 
-        for block in self.blocks:
+        for block_index, block in enumerate(self.blocks):
+            router = self.layer_routers[block_index] if self.layer_routers is not None else None
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    x, **kwargs,
+                    x, **{**kwargs, "layer_router": router},
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **kwargs)
+                x = block(x, **{**kwargs, "layer_router": router})
 
         if clean_x is not None:
             x = x[:, x.shape[1] // 2:]

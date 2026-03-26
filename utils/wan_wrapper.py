@@ -22,12 +22,12 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load("/home/adminad/GaoyanTian/model/wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name="/home/adminad/GaoyanTian/model/wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -66,7 +66,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path="/home/adminad/GaoyanTian/model/wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -119,18 +119,41 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            # V2 架构参数
+            use_dual_channel_head=False,
+            use_gumbel_router=False,
+            compression_ratio=4,
+            global_layer_indices=None,  # 硬编码的全局层索引列表，None表示所有层为全局层
+            use_curriculum_mask=False,
+            curriculum_total_steps=100000,
+            curriculum_start_step=5000,
+            curriculum_decay_mode='linear',
     ):
         super().__init__()
 
         if is_causal:
+            # 使用原始 CausalWanModel，现在支持 V2 参数
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                f"/home/adminad/GaoyanTian/model/wan_models/{model_name}/",
+                local_attn_size=local_attn_size,
+                sink_size=sink_size,
+                use_dual_channel_head=use_dual_channel_head,
+                use_gumbel_router=use_gumbel_router,
+                compression_ratio=compression_ratio,
+                global_layer_indices=global_layer_indices,
+                use_curriculum_mask=use_curriculum_mask,
+                curriculum_total_steps=curriculum_total_steps,
+                curriculum_start_step=curriculum_start_step,
+                curriculum_decay_mode=curriculum_decay_mode,
+            )
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(f"/home/adminad/GaoyanTian/model/wan_models/{model_name}/")
         self.model.eval()
 
-        # For non-causal diffusion, all frames share the same timestep
+        # For non-causal diffusion, all frames share the same timestep.
+        # Also used as the flag to determine whether the underlying model
+        # supports causal-specific kwargs (lookahead_blocks, force_update_mask).
         self.uniform_timestep = not is_causal
 
         self.scheduler = FlowMatchScheduler(
@@ -142,7 +165,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.post_init()
 
     def enable_gradient_checkpointing(self) -> None:
-        self.model.enable_gradient_checkpointing()
+        # CausalWanModel has its own gradient checkpointing implementation
+        if hasattr(self.model, '_set_gradient_checkpointing'):
+            self.model._set_gradient_checkpointing(self.model, True)
+        else:
+            self.model.enable_gradient_checkpointing()
 
     def adding_cls_branch(self, atten_dim=1536, num_class=4, time_embed_dim=0) -> None:
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
@@ -164,7 +191,6 @@ class WanDiffusionWrapper(torch.nn.Module):
             gan_ca_blocks.append(block)
         self._gan_ca_blocks = nn.ModuleList(gan_ca_blocks)
         self._gan_ca_blocks.requires_grad_(True)
-        # self.has_cls_branch = True
 
     def _convert_flow_pred_to_x0(self, flow_pred: torch.Tensor, xt: torch.Tensor, timestep: torch.Tensor) -> torch.Tensor:
         """
@@ -226,7 +252,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
-        updating_cache: Optional[bool] = False
+        updating_cache: Optional[bool] = False,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -235,6 +263,14 @@ class WanDiffusionWrapper(torch.nn.Module):
             input_timestep = timestep[:, 0]
         else:
             input_timestep = timestep
+
+        # ✅ Fix: 只有 CausalWanModel 才支持 lookahead_blocks / force_update_mask。
+        # uniform_timestep=True 说明底层是普通 WanModel，不传这两个参数。
+        is_causal_model = not self.uniform_timestep
+        causal_kwargs = (
+            {"lookahead_blocks": lookahead_blocks, "force_update_mask": force_update_mask}
+            if is_causal_model else {}
+        )
 
         logits = None
         # X0 prediction
@@ -247,7 +283,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start,
-                updating_cache=updating_cache
+                updating_cache=updating_cache,
+                **causal_kwargs
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -258,6 +295,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
+                    **causal_kwargs
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
@@ -269,14 +307,16 @@ class WanDiffusionWrapper(torch.nn.Module):
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings
+                        concat_time_embeddings=concat_time_embeddings,
+                        **causal_kwargs
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        **causal_kwargs
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

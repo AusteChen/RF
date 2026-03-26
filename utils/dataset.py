@@ -214,7 +214,58 @@ class TextImagePairDataset(Dataset):
         }
 
 
-def cycle(dl):
+class CSVDataset(Dataset):
+    def __init__(self, csv_path, video_id_col='video_id', prompt_col='prompt'):
+        import pandas as pd
+        self.df = pd.read_csv(csv_path)
+        self.video_ids = self.df[video_id_col].astype(str).tolist()
+        self.prompts = self.df[prompt_col].fillna('').astype(str).tolist()
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        return {
+            "prompts": [self.prompts[idx]],
+            "video_id": [self.video_ids[idx]],
+            "idx": idx,
+        }
+
+
+def cycle(dl, sampler=None, start_step=0):
+    """
+    无限循环 dataloader，支持断点续训跳过已训练样本。
+
+    原理：
+      DistributedSampler 每个 epoch 的 shuffle 顺序由 set_epoch(epoch) 决定。
+      续训时若不恢复 epoch 和 epoch 内偏移，会重放完全相同顺序的 prompt。
+      本函数根据 start_step 计算应从第几个 epoch / epoch 内第几个 batch 继续，
+      直接跳过已训练的部分，对训练循环透明。
+
+    参数：
+      dl         : DataLoader
+      sampler    : DistributedSampler（需要调用 set_epoch 来控制 shuffle 种子）
+      start_step : 续训起始 step（即已完成的 step 数），新训练时传 0
+    """
+    batches_per_epoch = len(dl)
+
+    if start_step > 0 and batches_per_epoch > 0:
+        skip_epochs  = start_step // batches_per_epoch
+        skip_batches = start_step % batches_per_epoch
+    else:
+        skip_epochs  = 0
+        skip_batches = 0
+
+    epoch = skip_epochs
+
     while True:
-        for data in dl:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
+        for batch_idx, data in enumerate(dl):
+            # 续训时在恢复的第一个 epoch 内跳过已训练的 batch
+            if epoch == skip_epochs and batch_idx < skip_batches:
+                continue
             yield data
+
+        epoch += 1

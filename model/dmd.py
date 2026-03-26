@@ -121,8 +121,12 @@ class DMD(RollingForcingModel):
         grad = torch.nan_to_num(grad)
 
         return grad, {
-            "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
-            "timestep": timestep.detach()
+            "dmdtrain_gradient_norm":  torch.mean(torch.abs(grad)).detach(),
+            "timestep":                timestep.detach(),
+            # 可视化用：各阶段中间潜变量（只取第一个 batch 元素节省显存）
+            "dmdtrain_noisy_latent":      noisy_image_or_video[:1].detach(),
+            "dmdtrain_pred_real_image":   pred_real_image[:1].detach(),
+            "dmdtrain_pred_fake_image":   pred_fake_image[:1].detach(),
         }
 
     def compute_distribution_matching_loss(
@@ -191,6 +195,10 @@ class DMD(RollingForcingModel):
         else:
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
             ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+
+        # 将 clean_latent 补充到 log_dict，供 distillation.py 可视化使用
+        dmd_log_dict["dmdtrain_clean_latent"] = original_latent[:1].detach()
+
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -199,30 +207,23 @@ class DMD(RollingForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Generate image/videos from noise and compute the DMD loss.
-        The noisy input to the generator is backward simulated.
-        This removes the need of any datasets during distillation.
-        See Sec 4.5 of the DMD2 paper (https://arxiv.org/abs/2405.14867) for details.
-        Input:
-            - image_or_video_shape: a list containing the shape of the image or video [B, F, C, H, W].
-            - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
-            - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
-            - clean_latent: a tensor containing the clean latents [B, F, C, H, W]. Need to be passed when no backward simulation is used.
-        Output:
-            - loss: a scalar tensor representing the generator loss.
-            - generator_log_dict: a dictionary containing the intermediate tensors for logging.
+        Generate image/videos from noise and compute the DMD loss + Architecture Regularization losses.
         """
         # Step 1: Unroll generator to obtain fake videos
         pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
-            initial_latent=initial_latent
+            initial_latent=initial_latent,
+            lookahead_blocks=lookahead_blocks,
+            force_update_mask=force_update_mask
         )
 
-        # Step 2: Compute the DMD loss
+        # Step 2: Compute the base DMD loss
         dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
             image_or_video=pred_image,
             conditional_dict=conditional_dict,
@@ -232,7 +233,51 @@ class DMD(RollingForcingModel):
             denoised_timestep_to=denoised_timestep_to
         )
 
-        return dmd_loss, dmd_log_dict
+        # -------------------------------------------------------------------------
+        # Step 3: Architecture-specific Losses (Gumbel Router Sparsity Penalty)
+        # -------------------------------------------------------------------------
+        total_loss = dmd_loss
+
+        # 动态获取配置参数（兼容未传参数时的安全回退）
+        use_gumbel_router = getattr(self.args, 'use_gumbel_router', False)
+        use_dual_channel_head = getattr(self.args, 'use_dual_channel_head', False)
+
+        if use_gumbel_router:
+            sparsity_loss = 0.0
+            router_count = 0
+
+            # 遍历底层模型的 Transformer block，提取路由器的 Softmax 概率
+            # 注意：self.generator 是 WanDiffusionWrapper，.model 才是 CausalWanModelV2
+            for block in self.generator.model.blocks:
+                if hasattr(block, 'self_attn') and hasattr(block.self_attn, 'layer_router'):
+                    # 获取该层的 logits: shape [2] -> [local_logit, global_logit]
+                    logits = block.self_attn.layer_router.routing_logits
+
+                    # 计算当前层被判定为"全局层 (索引为1)"的平滑概率
+                    probs = torch.nn.functional.softmax(logits, dim=0)
+                    prob_global = probs[1]
+
+                    sparsity_loss += prob_global
+                    router_count += 1
+
+            if router_count > 0:
+                sparsity_loss = sparsity_loss / router_count  # 取所有层的平均全局概率
+
+                # 获取稀疏性权重，建议在 yaml 中设置为 0.05 到 0.1 之间
+                lambda_sparsity = getattr(self.args, 'router_sparsity_weight', 0.05)
+
+                # 将稀疏性惩罚加入总 Loss
+                total_loss = total_loss + lambda_sparsity * sparsity_loss
+
+                # 记录到日志，极度方便你在 WandB/Tensorboard 监控层被剪枝的过程
+                dmd_log_dict["router_global_prob_mean"] = sparsity_loss.detach()
+                dmd_log_dict["router_sparsity_loss"] = (lambda_sparsity * sparsity_loss).detach()
+
+        # 注意：双通道提取头 (use_dual_channel_head) 无需显式 Loss。
+        # 它的计算是完全可微的，梯度的反向传播会自然地流经通道内的 mean pooling
+        # 和 torch.cat，引导前序层学习出更好的、不易漂移的时空表征。
+
+        return total_loss, dmd_log_dict
 
     def critic_loss(
         self,
@@ -240,7 +285,9 @@ class DMD(RollingForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: "torch.Tensor" = None,
+        lookahead_blocks: int = 0,
+        force_update_mask: bool = False
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and train the critic with generated samples.
@@ -326,7 +373,11 @@ class DMD(RollingForcingModel):
 
         # Step 5: Debugging Log
         critic_log_dict = {
-            "critic_timestep": critic_timestep.detach()
+            "critic_timestep":           critic_timestep.detach(),
+            # 可视化用（只取第一个 batch 元素节省显存）
+            "critictrain_latent":        generated_image[:1].detach(),
+            "critictrain_noisy_latent":  noisy_generated_image[:1].detach(),
+            "critictrain_pred_image":    pred_fake_image[:1].detach(),
         }
 
         return denoising_loss, critic_log_dict

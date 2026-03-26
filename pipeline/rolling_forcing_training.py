@@ -77,6 +77,8 @@ class RollingForcingTrainingPipeline:
             noise: torch.Tensor,
             initial_latent: Optional[torch.Tensor] = None,
             return_sim_step: bool = False,
+            lookahead_blocks: int = 0,
+            force_update_mask: bool = False,
             **conditional_dict
     ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
@@ -181,7 +183,9 @@ class RollingForcingTrainingPipeline:
                         timestep=current_timestep,
                         kv_cache=self.kv_cache_clean,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        lookahead_blocks=lookahead_blocks,
+                        force_update_mask=force_update_mask
                     )
             else:
                 _, denoised_pred = self.generator(
@@ -190,7 +194,9 @@ class RollingForcingTrainingPipeline:
                         timestep=current_timestep,
                         kv_cache=self.kv_cache_clean,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=current_start_frame * self.frame_seq_length,
+                        lookahead_blocks=lookahead_blocks,
+                        force_update_mask=force_update_mask
                     )
                 output[:, current_start_frame:current_end_frame] = denoised_pred
                 
@@ -243,6 +249,8 @@ class RollingForcingTrainingPipeline:
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                     updating_cache=True,
+                    lookahead_blocks=lookahead_blocks,
+                    force_update_mask=force_update_mask
                 )
 
         # Step 3.5: Return the denoised timestep
@@ -258,6 +266,8 @@ class RollingForcingTrainingPipeline:
             noise: torch.Tensor,
             initial_latent: Optional[torch.Tensor] = None,
             return_sim_step: bool = False,
+            lookahead_blocks: int = 0,
+            force_update_mask: bool = False,
             **conditional_dict
     ) -> torch.Tensor:
         batch_size, num_frames, num_channels, height, width = noise.shape
@@ -320,7 +330,9 @@ class RollingForcingTrainingPipeline:
                     timestep=timestep * 0,
                     kv_cache=self.kv_cache_clean,
                     crossattn_cache=self.crossattn_cache,
-                    current_start=current_start_frame * self.frame_seq_length
+                    current_start=current_start_frame * self.frame_seq_length,
+                    lookahead_blocks=lookahead_blocks,
+                    force_update_mask=force_update_mask
                 )
             current_start_frame += 1
 
@@ -356,7 +368,9 @@ class RollingForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache_clean,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            lookahead_blocks=lookahead_blocks,
+                            force_update_mask=force_update_mask
                         )
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
@@ -376,7 +390,9 @@ class RollingForcingTrainingPipeline:
                                 timestep=timestep,
                                 kv_cache=self.kv_cache_clean,
                                 crossattn_cache=self.crossattn_cache,
-                                current_start=current_start_frame * self.frame_seq_length
+                                current_start=current_start_frame * self.frame_seq_length,
+                            lookahead_blocks=lookahead_blocks,
+                            force_update_mask=force_update_mask
                             )
                     else:
                         _, denoised_pred = self.generator(
@@ -385,7 +401,9 @@ class RollingForcingTrainingPipeline:
                             timestep=timestep,
                             kv_cache=self.kv_cache_clean,
                             crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
+                            current_start=current_start_frame * self.frame_seq_length,
+                            lookahead_blocks=lookahead_blocks,
+                            force_update_mask=force_update_mask
                         )
                     break
 
@@ -410,6 +428,8 @@ class RollingForcingTrainingPipeline:
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                     updating_cache=True,
+                    lookahead_blocks=lookahead_blocks,
+                    force_update_mask=force_update_mask
                 )
 
             # Step 3.4: update the start and end frame indices

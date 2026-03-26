@@ -1,0 +1,74 @@
+python inference.py \
+    --config_path configs/rolling_forcing_dmd.yaml \
+    --output_folder videos/rolling_forcing_dmd \
+    --checkpoint_path /home/adminad/GaoyanTian/model/rolling_forcing/checkpoints/rolling_forcing_dmd.pt \
+    --data_path prompts/example_prompts.txt \
+    --num_output_frames 21 \
+    --use_ema
+
+python visualize.py --config_path configs/rolling_forcing_dmd.yaml --checkpoint_path /home/adminad/GaoyanTian/model/rolling_forcing/checkpoints/rolling_forcing_dmd.pt --prompt "A handheld camera captures a dog running through a park with a joyful exploration, the camera following the dog closely and bouncing and tilting with its movements. The dog bounds through the grass, tail wagging excitedly, sniffing at flowers and chasing after butterflies. Its fur glistens in the sunlight, and its eyes sparkle with enthusiasm. The park is filled with trees and colorful blooms, and the background shows a blurred path leading into the distance. The camera angle changes dynamically, providing a sense of the dog's lively energy and the vibrant environment around it." --output_dir /home/adminad/GaoyanTian/res/RF-visualization --window_index -1
+
+python inference.py \
+    --config_path configs/rolling_forcing_dmd.yaml \
+    --output_folder /home/adminad/GaoyanTian/tmp/rf-videos/rolling_forcing_exp0a \
+    --checkpoint_path /home/adminad/GaoyanTian/model/rolling_forcing/exp0a/checkpoint_last.pt \
+    --data_path prompts/prompt.txt \
+    --num_output_frames 21 \
+    --use_ema
+python inference.py \
+    --config_path configs/rolling_forcing_dmd.yaml \
+    --output_folder /home/adminad/GaoyanTian/model/rolling_forcing/exp0a/checkpoint_last.pt \
+    --data_path prompts/prompt.txt \
+    --num_output_frames 21 \
+    --use_ema
+
+mkdir -p /home/adminad/GaoyanTian/log/RF/exp0b
+cd /home/adminad/GaoyanTian/code/RollingForcing
+torchrun --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint 127.0.0.1:29500 \
+  train.py -- \
+  --config_path /home/adminad/GaoyanTian/code/RollingForcing/configs/exp0_curriculum_cosine.yaml \
+  --logdir /home/adminad/GaoyanTian/log/RF/exp0b \
+  --model-save-dir /home/adminad/GaoyanTian/model/rolling_forcing/exp0b \
+  --wandb-save-dir /home/adminad/GaoyanTian/log/RF/exp0b \
+  2>&1 | tee /home/adminad/GaoyanTian/log/RF/exp0b/train.log
+
+  --resume /home/adminad/GaoyanTian/model/rolling_forcing/exp1/checkpoint_last.pt
+
+cd /home/adminad/GaoyanTian/code/RollingForcing && \
+mkdir -p /home/adminad/GaoyanTian/data/Openvid-res/rf_exp0a && \
+nohup bash -c 'torchrun --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint 127.0.0.1:29500 \
+  inference_8gpu.py -- \
+  --config_path configs/rolling_forcing_dmd.yaml \
+  --checkpoint_path /home/adminad/GaoyanTian/model/rolling_forcing/exp0a/checkpoint_model_002000/model.pt \
+  --data_path /home/adminad/GaoyanTian/data/OpenVid_10k_Cleaned/val_set_2048.csv \
+  --output_folder /home/adminad/GaoyanTian/data/Openvid-res/rf_exp0a \
+  --num_output_frames 21 \
+  --use_ema \
+  --data_type csv' \
+  > /home/adminad/GaoyanTian/log/RF/exp0a/infer.log 2>&1 &
+
+
+
+torchrun --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint 127.0.0.1:29500 \
+  train.py -- \
+  --config_path /home/adminad/GaoyanTian/code/RollingForcing/configs/exp3.yaml \
+  --logdir /home/adminad/GaoyanTian/log/RF/exp3 \
+  --model-save-dir /home/adminad/GaoyanTian/model/rolling_forcing/exp3 \
+  --wandb-save-dir /home/adminad/GaoyanTian/log/RF/exp3 \
+  2>&1 | tee /home/adminad/GaoyanTian/log/RF/exp3/train.log
+
+torchrun --nproc_per_node=8 \
+  --rdzv_backend=c10d \
+  --rdzv_endpoint 127.0.0.1:29500 \
+  train.py -- \
+  --config_path /home/adminad/GaoyanTian/code/RollingForcing/configs/exp1.yaml \
+  --logdir /home/adminad/GaoyanTian/log/RF/just_test \
+  --model-save-dir /home/adminad/GaoyanTian/model/rolling_forcing/just_test \
+  --wandb-save-dir /home/adminad/GaoyanTian/log/RF/just_test \
+  2>&1 | tee /home/adminad/GaoyanTian/log/RF/just_test/train.log

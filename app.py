@@ -63,7 +63,7 @@ def _load_pipeline(config_path: str, checkpoint_path: Optional[str], use_ema: bo
     pipeline.eval()
 
     # Quick sanity path check for Wan models to give friendly errors
-    wan_dir = os.path.join('wan_models', 'Wan2.1-T2V-1.3B')
+    wan_dir = os.path.join('/home/adminad/GaoyanTian/model/wan_models', 'Wan2.1-T2V-1.3B')
     if not os.path.isdir(wan_dir):
         raise gr.Error(
             "Wan2.1-T2V-1.3B not found at 'wan_models/Wan2.1-T2V-1.3B'.\n"
@@ -123,7 +123,7 @@ def main():
                         help='Path to the model config')
     parser.add_argument('--checkpoint_path', type=str, default='checkpoints/rolling_forcing_dmd.pt',
                         help='Path to rolling forcing checkpoint (.pt). If missing, will run with base weights only if available.')
-    parser.add_argument('--output_dir', type=str, default='videos/gradio', help='Where to save generated videos')
+    parser.add_argument('--output_dir', type=str, default='/home/adminad/GaoyanTian/tmp/videos/gradio', help='Where to save generated videos')
     parser.add_argument('--no_ema', action='store_true', help='Disable EMA weights when loading checkpoint')
     parser.add_argument('--server_name', type=str, default='0.0.0.0', help='Gradio server host')
     parser.add_argument('--server_port', type=int, default=7860, help='Gradio server port')
@@ -151,7 +151,6 @@ def main():
             "If you find this demo useful, please consider giving it a ⭐ star on [GitHub](https://github.com/TencentARC/RollingForcing)--your support is crucial for sustaining this open-source project. "
             "You can also dive deeper by reading the [paper](https://arxiv.org/abs/2509.25161) or exploring the [project page](https://kunhao-liu.github.io/Rolling_Forcing_Webpage) for more details."
         ),
-        allow_flagging='never',
     )
 
     try:
