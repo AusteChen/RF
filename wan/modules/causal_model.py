@@ -8,7 +8,7 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
-# from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 # from torch.nn.attention.flex_attention import BlockMask
 from diffusers.models.modeling_utils import ModelMixin
@@ -144,22 +144,38 @@ class LayerRouter(nn.Module):
         with torch.no_grad():
             self.routing_logits.copy_(torch.tensor([init_local, init_global]))
 
-    def forward(self, temperature: float = 1.0) -> torch.Tensor:
+    def forward(
+        self,
+        temperature: float = 1.0,
+        step: int = 0,
+        total_steps: int = 100000,
+        warmup_steps: int = 5000,
+    ) -> torch.Tensor:
         """
         前向传播：直接输出这一层是否为全局层的确切决策（标量）。
 
         Args:
             temperature: Gumbel-Softmax 退火温度。
-
+            step: 当前训练步数（用于自动温度退火）。
+            total_steps: 总训练步数（用于温度退火进度计算）。
+            warmup_steps: 预热步数（前 warmup_steps 步内温度保持初始值 tau_start）。
         Returns:
             is_global: 标量张量 (1.0 代表全局层，0.0 代表局部层)
         """
+        # 自动温度退火：warmup 结束后从 tau_start 线性降到 tau_end
+        if step < warmup_steps:
+            tau = temperature  # 使用传入的初始温度
+        else:
+            progress = min(1.0, (step - warmup_steps) / max(1, total_steps - warmup_steps))
+            tau_start, tau_end = 5.0, 0.5
+            tau = tau_start + (tau_end - tau_start) * progress
+
         if self.training:
             # 官方底层的 Gumbel Softmax。自带噪声与 STE (hard=True)
             # 输出类似 [0.0, 1.0] 的 one-hot 向量
             routing_weights = F.gumbel_softmax(
                 self.routing_logits,
-                tau=temperature,
+                tau=tau,
                 hard=True,
                 dim=0
             )
@@ -172,9 +188,8 @@ class LayerRouter(nn.Module):
 
         return is_global
 
-
 # ========================================
-# 新增：双通道历史信息提取头
+# 新增：双通道历史信息提取头（无状态核心）
 # ========================================
 
 class DualChannelExtractionHead(nn.Module):
@@ -183,6 +198,8 @@ class DualChannelExtractionHead(nn.Module):
 
     通道一：基于余弦相似度检测场景切换，动态更新 1-2 帧局部锚点。
     通道二：将滑出窗口的废弃特征 (evicted) 进行空间池化降维，拼接到定长队列中。
+
+    训练支持：主训练链路走 kv-cache 展开时，通道二会通过 eviction 事件接收梯度。
     """
 
     def __init__(
@@ -190,10 +207,9 @@ class DualChannelExtractionHead(nn.Module):
         dim: int,
         num_heads: int,
         head_dim: int,
-        memory_size: int = 100,      # 固定长度的记忆队列容量
-        anchor_frames: int = 2,      # 动态锚点保留的帧数
-        scene_change_tau: float = 0.6, # 场景切换的相似度阈值
-        compression_ratio: int = 4,  # 空间下采样率 (如 4 代表 2x2 池化)
+        memory_size: int = 100,       # 固定长度 FIFO（按 frame token 计）
+        anchor_frames: int = 2,       # 动态 sink 保留的帧 token 数
+        scene_change_tau: float = 0.6,
     ):
         super().__init__()
         self.dim = dim
@@ -202,129 +218,198 @@ class DualChannelExtractionHead(nn.Module):
         self.memory_size = memory_size
         self.anchor_frames = anchor_frames
         self.scene_change_tau = scene_change_tau
-        self.compression_ratio = compression_ratio
 
         # 动态状态（不使用 Parameter，因为形状受 Batch 影响且随时间增长）
         # 在 forward 中动态初始化
         self.memory_k = None
         self.memory_v = None
+        self.sink_k = None
+        self.sink_v = None
         self.last_frame_key = None
+
+        # 这几组轻量投影让双路头具备可训练能力。
+        self.sink_key_proj = nn.Linear(head_dim, head_dim, bias=False)
+        self.sink_value_proj = nn.Linear(head_dim, head_dim, bias=False)
+        self.memory_key_proj = nn.Linear(head_dim, head_dim, bias=False)
+        self.memory_value_proj = nn.Linear(head_dim, head_dim, bias=False)
 
     def reset_parameters(self):
         """重置动态状态，确保与 PyTorch FSDP 兼容"""
-        # 动态状态不需要参数初始化，但需要重置为 None
         self.memory_k = None
         self.memory_v = None
+        self.sink_k = None
+        self.sink_v = None
         self.last_frame_key = None
+
+    def _pool_frame_tokens(self, x: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
+        """
+        将单帧的空间 token 压成 1 个 frame token，输出 [B, T, N, D]。
+        这是功能 3 的固定长度 FIFO 版本：先按 frame 压缩，再做 FIFO。
+        """
+        b, s, n, d = x.shape
+        h, w = spatial_shape
+        tokens_per_frame = max(1, h * w)
+
+        if s % tokens_per_frame != 0:
+            target_t = max(1, round(s / tokens_per_frame))
+            pooled = F.adaptive_avg_pool1d(
+                x.permute(0, 2, 3, 1).reshape(b * n, d, s),
+                target_t,
+            )
+            return pooled.reshape(b, n, d, target_t).permute(0, 3, 1, 2)
+
+        t = s // tokens_per_frame
+        return x.reshape(b, t, tokens_per_frame, n, d).mean(dim=2)
+
+    def _apply_proj(self, x: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
+        b, t, n, d = x.shape
+        return proj(x.reshape(b * t * n, d)).reshape(b, t, n, d)
+
+    def _compute_sink(
+        self,
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        last_frame_key: torch.Tensor,
+    ) -> tuple:
+        """
+        通道一：动态 attention sink。
+        所有层都能访问这一路；当检测到场景变化时，用当前块的前若干 frame token 刷新 sink。
+        """
+        current_frame_repr = current_k.mean(dim=2).mean(dim=1)
+
+        if last_frame_key is not None:
+            current_norm = F.normalize(current_frame_repr, dim=-1)
+            last_norm = F.normalize(last_frame_key, dim=-1)
+            similarity = (current_norm * last_norm).sum(dim=-1).mean().item()
+            is_scene_change = similarity < self.scene_change_tau
+        else:
+            is_scene_change = True
+
+        sink_source_k = current_k[:, :self.anchor_frames]
+        sink_source_v = current_v[:, :self.anchor_frames]
+        new_sink_k = self._apply_proj(sink_source_k, self.sink_key_proj)
+        new_sink_v = self._apply_proj(sink_source_v, self.sink_value_proj)
+
+        return new_sink_k, new_sink_v, current_frame_repr.detach(), is_scene_change
+
+    def _compute_fifo_memory(
+        self,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        memory_k: torch.Tensor,
+        memory_v: torch.Tensor,
+        spatial_shape: tuple,
+    ) -> tuple:
+        """
+        通道二：固定长度 FIFO 历史压缩。
+        先按 frame 压缩成少量 token，再追加到固定长度 memory queue。
+        """
+        pooled_k = self._pool_frame_tokens(evicted_k, spatial_shape)
+        pooled_v = self._pool_frame_tokens(evicted_v, spatial_shape)
+        compressed_k = self._apply_proj(pooled_k, self.memory_key_proj)
+        compressed_v = self._apply_proj(pooled_v, self.memory_value_proj)
+
+        if memory_k is None:
+            new_memory_k = compressed_k
+            new_memory_v = compressed_v
+        else:
+            new_memory_k = torch.cat([memory_k, compressed_k], dim=1)
+            new_memory_v = torch.cat([memory_v, compressed_v], dim=1)
+
+        if new_memory_k.shape[1] > self.memory_size:
+            new_memory_k = new_memory_k[:, -self.memory_size:, :, :]
+            new_memory_v = new_memory_v[:, -self.memory_size:, :, :]
+
+        return new_memory_k, new_memory_v, new_memory_k, new_memory_v
 
     def forward(
         self,
-        current_k: torch.Tensor,   # [B, S_curr, N, D] 当前窗口的 K
-        current_v: torch.Tensor,   # [B, S_curr, N, D] 当前窗口的 V
-        evicted_k: torch.Tensor,   # [B, S_evict, N, D] 滑出窗口即将被丢弃的 K (可能为 None)
-        evicted_v: torch.Tensor,   # [B, S_evict, N, D] 滑出窗口即将被丢弃的 V (可能为 None)
-        is_global_layer: bool,     # 标量布尔值：当前是否是全局层
-        spatial_shape: tuple,      # (H, W) 当前特征图的空间分辨率
+        current_k: torch.Tensor,
+        current_v: torch.Tensor,
+        evicted_k: torch.Tensor,
+        evicted_v: torch.Tensor,
+        is_global_layer: bool,
+        spatial_shape: tuple,
+        last_frame_key: torch.Tensor = None,
+        sink_k: torch.Tensor = None,
+        sink_v: torch.Tensor = None,
+        memory_k: torch.Tensor = None,
+        memory_v: torch.Tensor = None,
+        update_state: bool = True,
     ) -> dict:
-
-        B, S_curr, N, D = current_k.shape
         output = {
-            'anchor_k': None,
-            'anchor_v': None,
+            'sink_k': None,
+            'sink_v': None,
             'memory_k': None,
             'memory_v': None,
             'is_scene_change': False,
+            'last_frame_key_out': last_frame_key,
+            'sink_k_out': sink_k,
+            'sink_v_out': sink_v,
+            'memory_k_out': memory_k,
+            'memory_v_out': memory_v,
         }
 
-        # ==========================================
-        # 通道一：动态锚点流 (检测当前窗口的场景变化)
-        # ==========================================
-        # 获取当前窗口最后一帧的平均特征表示 [B, D]
-        current_frame_repr = current_k[:, -1, :, :].mean(dim=1)
+        current_frame_k = self._pool_frame_tokens(current_k, spatial_shape)
+        current_frame_v = self._pool_frame_tokens(current_v, spatial_shape)
 
-        if self.last_frame_key is not None:
-            # 计算余弦相似度
-            current_norm = F.normalize(current_frame_repr, dim=-1)
-            last_norm = F.normalize(self.last_frame_key, dim=-1)
-            similarity = (current_norm * last_norm).sum(dim=-1).mean().item()
-
-            is_scene_change = similarity < self.scene_change_tau
-        else:
-            is_scene_change = True  # 第一帧强制视为场景切换
-
-        self.last_frame_key = current_frame_repr.detach()
+        current_sink_k, current_sink_v, last_frame_key_out, is_scene_change = self._compute_sink(
+            current_frame_k,
+            current_frame_v,
+            last_frame_key,
+        )
         output['is_scene_change'] = is_scene_change
 
-        if is_scene_change:
-            # 截取当前窗口最初的几帧作为新的动态锚点
-            output['anchor_k'] = current_k[:, :self.anchor_frames, :, :]
-            output['anchor_v'] = current_v[:, :self.anchor_frames, :, :]
+        if update_state:
+            if is_scene_change or self.sink_k is None:
+                self.sink_k = current_sink_k.detach()
+                self.sink_v = current_sink_v.detach()
+            output['sink_k'] = current_sink_k if (is_scene_change or sink_k is None) else self.sink_k
+            output['sink_v'] = current_sink_v if (is_scene_change or sink_v is None) else self.sink_v
+            self.last_frame_key = last_frame_key_out
+        else:
+            sink_k_out = current_sink_k if (is_scene_change or sink_k is None) else sink_k
+            sink_v_out = current_sink_v if (is_scene_change or sink_v is None) else sink_v
+            output['sink_k'] = sink_k_out
+            output['sink_v'] = sink_v_out
+            output['sink_k_out'] = sink_k_out.detach() if sink_k_out is not None else None
+            output['sink_v_out'] = sink_v_out.detach() if sink_v_out is not None else None
+            output['last_frame_key_out'] = last_frame_key_out
 
-        # ==========================================
-        # 通道二：增量压缩历史流 (仅全局层工作，仅处理 evicted)
-        # ==========================================
-        if is_global_layer and evicted_k is not None and evicted_k.shape[1] > 0:
+        if evicted_k is not None and evicted_k.shape[1] > 0:
+            new_memory_k, new_memory_v, memory_k_out, memory_v_out = self._compute_fifo_memory(
+                evicted_k,
+                evicted_v,
+                memory_k if not update_state else self.memory_k,
+                memory_v if not update_state else self.memory_v,
+                spatial_shape,
+            )
 
-            # 1. 空间池化压缩
-            compressed_k = self._spatial_pool(evicted_k, spatial_shape)
-            compressed_v = self._spatial_pool(evicted_v, spatial_shape)
-
-            # 2. 追加到记忆队列
-            if self.memory_k is None:
-                self.memory_k = compressed_k.detach()
-                self.memory_v = compressed_v.detach()
+            if update_state:
+                self.memory_k = memory_k_out.detach()
+                self.memory_v = memory_v_out.detach()
+                output['memory_k'] = new_memory_k
+                output['memory_v'] = new_memory_v
             else:
-                self.memory_k = torch.cat([self.memory_k, compressed_k.detach()], dim=1)
-                self.memory_v = torch.cat([self.memory_v, compressed_v.detach()], dim=1)
-
-            # 3. 定长 FIFO 截断 (避免 OOM)
-            if self.memory_k.shape[1] > self.memory_size:
-                self.memory_k = self.memory_k[:, -self.memory_size:, :, :]
-                self.memory_v = self.memory_v[:, -self.memory_size:, :, :]
-
+                output['memory_k'] = new_memory_k
+                output['memory_v'] = new_memory_v
+                output['memory_k_out'] = memory_k_out.detach()
+                output['memory_v_out'] = memory_v_out.detach()
+        elif update_state:
             output['memory_k'] = self.memory_k
             output['memory_v'] = self.memory_v
+        else:
+            output['memory_k'] = memory_k
+            output['memory_v'] = memory_v
 
         return output
-
-    def _spatial_pool(self, x: torch.Tensor, spatial_shape: tuple) -> torch.Tensor:
-        """安全的空间 2D 池化，保持时间维度不变"""
-        B, S, N, D = x.shape
-        H, W = spatial_shape
-        T = S // (H * W)
-
-        # 兜底：如果序列中包含特殊 token 导致无法整除，直接对序列长度进行 1D 降维
-        if S % (H * W) != 0:
-            target_S = max(1, S // self.compression_ratio)
-            # x 变成 [B*N, D, S] 进行 1D 均值池化
-            x_pool = F.adaptive_avg_pool1d(x.permute(0, 2, 3, 1).reshape(B * N, D, S), target_S)
-            return x_pool.reshape(B, N, D, target_S).permute(0, 3, 1, 2)
-
-        # 还原回空间结构: [B, T, H, W, N, D]
-        x = x.reshape(B, T, H, W, N, D)
-
-        # 在 H, W 维度上进行 2D 池化
-        if H >= self.compression_ratio and W >= self.compression_ratio:
-            h_pool = H // self.compression_ratio
-            w_pool = W // self.compression_ratio
-            x = x.permute(0, 1, 4, 2, 3, 5).reshape(B * T * N, 1, H, W)
-            x = F.avg_pool2d(x, kernel_size=(self.compression_ratio, self.compression_ratio),
-                             stride=(self.compression_ratio, self.compression_ratio))
-            x = x.reshape(B, T, N, h_pool, w_pool, D).permute(0, 1, 3, 4, 2, 5)
-        else:
-            # H 或 W 比 compression_ratio 小时，直接用 1D 池化
-            target_S = max(1, S // self.compression_ratio)
-            x_pool = F.adaptive_avg_pool1d(x.permute(0, 2, 3, 1).reshape(B * N, D, S), target_S)
-            x = x_pool.reshape(B, N, target_S, D).permute(0, 2, 1, 3)
-
-        # 重新展平为 [B, S', N, D]
-        S_new = x.shape[1] * x.shape[2] * x.shape[3]
-        return x.reshape(B, S_new, N, D)
 
     def reset(self):
         """重置动态状态"""
         self.memory_k = None
         self.memory_v = None
+        self.sink_k = None
+        self.sink_v = None
         self.last_frame_key = None
 
 
@@ -348,6 +433,7 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_length = 1560
         self.max_attention_size = 21 * self.frame_length
         self.block_length = 3 * self.frame_length
+        self.sink_size = max(1, sink_size)
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -368,8 +454,11 @@ class CausalWanSelfAttention(nn.Module):
         current_start=0,
         cache_start=None,
         updating_cache=False,
-        extra_k=None,   # [B, S_extra, N, D]  来自 DualChannelExtractionHead 的附加 K（仅推理 kv_cache 分支）
-        extra_v=None,   # [B, S_extra, N, D]  来自 DualChannelExtractionHead 的附加 V（仅推理 kv_cache 分支）
+        sink_k=None,    # [B, S_sink, N, D]  动态 attention sink，所有层可见
+        sink_v=None,
+        memory_k=None,  # [B, S_mem, N, D]   FIFO 压缩历史，仅全局层可见
+        memory_v=None,
+        global_gate=None,  # 标量 gate，1 表示全局层，0 表示局部层
     ):
         r"""
         Args:
@@ -378,8 +467,8 @@ class CausalWanSelfAttention(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             block_mask (BlockMask)
-            extra_k/extra_v: 可选的附加历史 KV（由 DualChannelExtractionHead 提供），
-                             仅在 kv_cache 推理分支中拼接到 anchor + working cache 之前。
+            sink_k/sink_v: 动态 attention sink，局部层和全局层都可访问。
+            memory_k/memory_v: FIFO 压缩历史，仅全局层访问。
         """
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
         if cache_start is None:
@@ -485,7 +574,7 @@ class CausalWanSelfAttention(nn.Module):
             num_new_tokens = cache_end - kv_cache["global_end_index"].item()
             kv_cache_size = kv_cache["k"].shape[1]
 
-            sink_tokens = 1 * self.block_length # we keep the first block in the cache
+            sink_tokens = self.sink_size * self.block_length
 
             if (num_new_tokens > 0) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
@@ -495,7 +584,24 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                 kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                     kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                
+
+                # 收集被驱逐的 tokens，供 DualChannelExtractionHead 的通道二使用
+                evicted_tokens_k = kv_cache["k"][:, sink_tokens:sink_tokens + num_evicted_tokens].clone()
+                evicted_tokens_v = kv_cache["v"][:, sink_tokens:sink_tokens + num_evicted_tokens].clone()
+
+                if "evicted_k" in kv_cache and "evicted_v" in kv_cache:
+                    evicted_k_data = kv_cache["evicted_k"]
+                    evicted_v_data = kv_cache["evicted_v"]
+                    new_evicted_k = torch.cat([evicted_k_data, evicted_tokens_k], dim=1)
+                    new_evicted_v = torch.cat([evicted_v_data, evicted_tokens_v], dim=1)
+                    # 限制 evicted queue 的大小（最多保留最近 2 * memory_size 个 token）
+                    max_evicted_size = 2 * 1560 * 24
+                    if new_evicted_k.shape[1] > max_evicted_size:
+                        new_evicted_k = new_evicted_k[:, -max_evicted_size:, :, :]
+                        new_evicted_v = new_evicted_v[:, -max_evicted_size:, :, :]
+                    kv_cache["evicted_k"] = new_evicted_k
+                    kv_cache["evicted_v"] = new_evicted_v
+
                 local_end_index = kv_cache["local_end_index"].item() + cache_end - \
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - self.block_length
@@ -540,42 +646,69 @@ class CausalWanSelfAttention(nn.Module):
 
                 else:
                     # 1. extract working cache
-                    # calculate the length of working cache
-                    query_length = roped_query.shape[1]
-                    working_cache_max_length = self.max_attention_size - query_length - self.block_length
-
                     extract_cache_end = local_start_index
-                    extract_cache_start = max(self.block_length, local_start_index - working_cache_max_length) # working cache does not include the first anchor block
+                    if global_gate is None:
+                        query_length = roped_query.shape[1]
+                        working_cache_max_length = self.max_attention_size - query_length - self.block_length
+                    elif self.local_attn_size != -1:
+                        working_cache_max_length = self.local_attn_size * self.frame_length
+                    else:
+                        # 当启用 router 时，默认把主 working cache 控制在最近 1 个 block；
+                        # 更远历史统一交给 FIFO 压缩记忆。
+                        working_cache_max_length = self.block_length
+                    extract_cache_start = max(
+                        self.block_length,
+                        local_start_index - working_cache_max_length,
+                    )
                     working_cache_key = kv_cache["k"][:, extract_cache_start:extract_cache_end]
                     working_cache_v = kv_cache["v"][:, extract_cache_start:extract_cache_end]
 
-                    # 2. extract anchor cache, roped as the past frame
+                    # 2. 保留原始 anchor 作为 route A 的兜底。
                     working_cache_frame_length = working_cache_key.shape[1] // self.frame_length
                     rope_start_frame = current_start_frame - working_cache_frame_length - 3
-
                     anchor_cache_key = causal_rope_apply(
-                        kv_cache["k"][:, :self.block_length], grid_sizes_one_block, freqs, start_frame=rope_start_frame).type_as(v)
+                        kv_cache["k"][:, :self.block_length],
+                        grid_sizes_one_block,
+                        freqs,
+                        start_frame=rope_start_frame,
+                    ).type_as(v)
                     anchor_cache_v = kv_cache["v"][:, :self.block_length]
 
-                    # 3. 组装 key/value，按顺序：
-                    #    [extra(双通道历史)] + [anchor(第一块)] + [working cache] + [current]
-                    #    extra_k/v 来自 DualChannelExtractionHead，仅当传入时拼接
-                    key_parts = []
-                    v_parts = []
-                    if extra_k is not None and extra_v is not None:
-                        key_parts.append(extra_k)
-                        v_parts.append(extra_v)
-                    key_parts += [anchor_cache_key, working_cache_key, roped_key]
-                    v_parts   += [anchor_cache_v,   working_cache_v,   v]
+                    local_key_parts = []
+                    local_v_parts = []
+                    if sink_k is not None and sink_v is not None:
+                        local_key_parts.append(sink_k)
+                        local_v_parts.append(sink_v)
+                    else:
+                        local_key_parts.append(anchor_cache_key)
+                        local_v_parts.append(anchor_cache_v)
+                    local_key_parts += [working_cache_key, roped_key]
+                    local_v_parts += [working_cache_v, v]
 
-                    input_key = torch.cat(key_parts, dim=1)
-                    input_v   = torch.cat(v_parts,   dim=1)
-
-                    x = attention(
+                    local_out = attention(
                         roped_query,
-                        input_key,
-                        input_v
+                        torch.cat(local_key_parts, dim=1),
+                        torch.cat(local_v_parts, dim=1),
                     )
+
+                    if memory_k is not None and memory_v is not None:
+                        global_key_parts = local_key_parts[:1] + [memory_k] + local_key_parts[1:]
+                        global_v_parts = local_v_parts[:1] + [memory_v] + local_v_parts[1:]
+                        global_out = attention(
+                            roped_query,
+                            torch.cat(global_key_parts, dim=1),
+                            torch.cat(global_v_parts, dim=1),
+                        )
+
+                        if global_gate is None:
+                            x = global_out
+                        elif self.training:
+                            gate = global_gate.to(dtype=local_out.dtype, device=local_out.device).view(1, 1, 1, 1)
+                            x = local_out * (1 - gate) + global_out * gate
+                        else:
+                            x = global_out if global_gate.detach().item() >= 0.5 else local_out
+                    else:
+                        x = local_out
                  
 
         # output
@@ -599,7 +732,9 @@ class CausalWanAttentionBlock(nn.Module):
                  # 新增参数
                  is_global_layer=None,
                  use_dual_channel_head=False,
-                 compression_ratio=4,
+                 memory_size=100,
+                 anchor_frames=2,
+                 scene_change_tau=0.6,
                  ):
         super().__init__()
         self.dim = dim
@@ -613,7 +748,6 @@ class CausalWanAttentionBlock(nn.Module):
         # 新增参数
         self.is_global_layer = is_global_layer
         self.use_dual_channel_head = use_dual_channel_head
-        self.compression_ratio = compression_ratio
 
         # 双通道历史信息提取头
         if use_dual_channel_head:
@@ -622,7 +756,9 @@ class CausalWanAttentionBlock(nn.Module):
                 dim=dim,
                 num_heads=num_heads,
                 head_dim=head_dim,
-                compression_ratio=compression_ratio,
+                memory_size=memory_size,
+                anchor_frames=anchor_frames,
+                scene_change_tau=scene_change_tau,
             )
         else:
             self.dual_channel_head = None
@@ -671,6 +807,9 @@ class CausalWanAttentionBlock(nn.Module):
         current_start=0,
         cache_start=None,
         layer_router=None,   # 可选的 LayerRouter 实例（由 CausalWanModel 的 block loop 传入）
+        router_step=0,
+        router_total_steps=100000,
+        router_warmup_steps=5000,
     ):
         r"""
         Args:
@@ -680,6 +819,9 @@ class CausalWanAttentionBlock(nn.Module):
             grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
             layer_router: 可选 LayerRouter；若传入则用动态路由决策覆盖 is_global_layer。
+            router_step: 当前训练步数（供路由器温度退火）。
+            router_total_steps: 总训练步数。
+            router_warmup_steps: 路由器温度退火预热步数。
         """
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
@@ -689,62 +831,77 @@ class CausalWanAttentionBlock(nn.Module):
         #    优先级：layer_router（动态）> is_global_layer（硬编码）> 默认全局
         # -------------------------------------------------------
         if layer_router is not None:
-            is_global = layer_router()          # 标量 Tensor: 1.0=全局, 0.0=局部
-            is_global_bool = is_global.item() > 0.5
-        elif self.is_global_layer is not None:
-            is_global_bool = self.is_global_layer
-        else:
-            is_global_bool = True               # 未指定时默认全局
-
-        # -------------------------------------------------------
-        # 2. 双通道历史信息提取（仅推理 kv_cache 路径，且非 updating_cache 时）
-        # -------------------------------------------------------
-        extra_k, extra_v = None, None
-        if self.dual_channel_head is not None and kv_cache is not None and not updating_cache:
-            b, s_total = x.shape[:2]
-            n, d = self.num_heads, self.dim // self.num_heads
-            # 先对 x 做 norm+modulation 得到与 self_attn 一致的输入
-            normed_x = (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
-                        * (1 + e[1]) + e[0]).flatten(1, 2)
-            curr_k = self.self_attn.norm_k(self.self_attn.k(normed_x)).view(b, s_total, n, d)
-            curr_v = self.self_attn.v(normed_x).view(b, s_total, n, d)
-
-            # evicted KV 由 kv_cache 中可选字段传入（需要上层写入；若未写入则为 None）
-            evicted_k = kv_cache.get("evicted_k", None) if isinstance(kv_cache, dict) else None
-            evicted_v = kv_cache.get("evicted_v", None) if isinstance(kv_cache, dict) else None
-
-            H = grid_sizes[0][1].item()
-            W = grid_sizes[0][2].item()
-            head_out = self.dual_channel_head(
-                current_k=curr_k,
-                current_v=curr_v,
-                evicted_k=evicted_k,
-                evicted_v=evicted_v,
-                is_global_layer=is_global_bool,
-                spatial_shape=(H, W),
+            global_gate = layer_router(
+                step=router_step,
+                total_steps=router_total_steps,
+                warmup_steps=router_warmup_steps,
             )
-
-            parts_k, parts_v = [], []
-            if head_out["anchor_k"] is not None:
-                parts_k.append(head_out["anchor_k"])
-                parts_v.append(head_out["anchor_v"])
-            if head_out["memory_k"] is not None:
-                parts_k.append(head_out["memory_k"])
-                parts_v.append(head_out["memory_v"])
-            if parts_k:
-                extra_k = torch.cat(parts_k, dim=1)
-                extra_v = torch.cat(parts_v, dim=1)
+        elif self.dual_channel_head is not None and self.is_global_layer is not None:
+            global_gate = x.new_tensor(float(self.is_global_layer))
+        else:
+            global_gate = None
+        is_global_bool = True if global_gate is None else (global_gate.detach().item() > 0.5)
 
         # -------------------------------------------------------
-        # 3. Self-attention（传入 extra_k/v）
+        # 2. Dual-channel history extraction
+        #    - Inference path  (kv_cache not None, not updating_cache): eviction-based
+        #    - Training path    (kv_cache is None): full-sequence auxiliary path
+        #      The head still participates in the forward pass so its parameters
+        #      receive gradients; output is discarded (no KV cache to extend).
+        # -------------------------------------------------------
+        sink_k, sink_v = None, None
+        memory_k, memory_v = None, None
+        if self.dual_channel_head is not None:
+            if kv_cache is not None and not updating_cache:
+                # --- Inference path (unchanged) ---
+                b, s_total = x.shape[:2]
+                n, d = self.num_heads, self.dim // self.num_heads
+                normed_x = (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
+                            * (1 + e[1]) + e[0]).flatten(1, 2)
+                curr_k = self.self_attn.norm_k(self.self_attn.k(normed_x)).view(b, s_total, n, d)
+                curr_v = self.self_attn.v(normed_x).view(b, s_total, n, d)
+
+                evicted_k = kv_cache.get("evicted_k", None) if isinstance(kv_cache, dict) else None
+                evicted_v = kv_cache.get("evicted_v", None) if isinstance(kv_cache, dict) else None
+
+                H = grid_sizes[0][1].item()
+                W = grid_sizes[0][2].item()
+                head_out = self.dual_channel_head(
+                    current_k=curr_k,
+                    current_v=curr_v,
+                    evicted_k=evicted_k,
+                    evicted_v=evicted_v,
+                    is_global_layer=is_global_bool,
+                    spatial_shape=(H, W),
+                    update_state=True,  # 推理路径：更新内部状态
+                )
+                sink_k = head_out["sink_k"]
+                sink_v = head_out["sink_v"]
+                memory_k = head_out["memory_k"]
+                memory_v = head_out["memory_v"]
+                # evicted queue 只应被消费一次；否则同一批历史会被重复压入 FIFO memory。
+                if isinstance(kv_cache, dict) and evicted_k is not None and evicted_k.shape[1] > 0:
+                    kv_cache["evicted_k"] = evicted_k[:, :0]
+                    kv_cache["evicted_v"] = evicted_v[:, :0]
+
+            else:
+                # score distillation 主训练路径走 kv-cache 展开，双路头会在那条路径里收到梯度。
+                # 这里保留 no-op，避免普通全序列训练路径引入额外的 mask 复杂度。
+                pass
+
+        # -------------------------------------------------------
+        # 3. Self-attention（传入 sink/memory + router gate）
         # -------------------------------------------------------
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
             seq_lens, grid_sizes,
             freqs, block_mask, kv_cache, current_start, cache_start,
             updating_cache=updating_cache,
-            extra_k=extra_k,
-            extra_v=extra_v,
+            sink_k=sink_k,
+            sink_v=sink_v,
+            memory_k=memory_k,
+            memory_v=memory_v,
+            global_gate=global_gate,
         )
 
         x = x + (y.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * e[2]).flatten(1, 2)
@@ -838,7 +995,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  # 新增参数
                  use_dual_channel_head=False,
                  use_gumbel_router=False,
-                 compression_ratio=4,
+                 memory_size=100,
+                 anchor_frames=2,
+                 scene_change_tau=0.6,
                  global_layer_indices=None,  # None表示所有层为全局层
                  use_curriculum_mask=False,
                  curriculum_total_steps=100000,
@@ -885,8 +1044,12 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 是否使用双通道历史信息提取头
             use_gumbel_router (`bool`, *optional*, defaults to False):
                 是否使用 Gumbel-Softmax 门控路由器
-            compression_ratio (`int`, *optional*, defaults to 4):
-                历史信息压缩比
+            memory_size (`int`, *optional*, defaults to 100):
+                FIFO 压缩历史队列的最大长度（按 frame token 计）
+            anchor_frames (`int`, *optional*, defaults to 2):
+                动态 attention sink 保留的 frame token 数
+            scene_change_tau (`float`, *optional*, defaults to 0.6):
+                动态 sink 的场景切换阈值
             global_layer_indices (`list`, *optional*, defaults to None):
                 特定的全局层索引列表（None表示所有层为全局层）
             use_curriculum_mask (`bool`, *optional*, defaults to False):
@@ -922,7 +1085,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # 新增参数
         self.use_dual_channel_head = use_dual_channel_head
         self.use_gumbel_router = use_gumbel_router
-        self.compression_ratio = compression_ratio
 
         # 处理全局层索引
         # 逻辑：
@@ -981,7 +1143,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 local_attn_size, sink_size, qk_norm, cross_attn_norm, eps,
                 is_global_layer=is_global_layer,
                 use_dual_channel_head=use_dual_channel_head,
-                compression_ratio=compression_ratio,
+                memory_size=memory_size,
+                anchor_frames=anchor_frames,
+                scene_change_tau=scene_change_tau,
             )
             self.blocks.append(block)
 
@@ -1019,9 +1183,27 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
+        # 当前训练步数（供 LayerRouter 的温度退火使用）
+        self.current_step = 0
+        self.router_total_steps = curriculum_total_steps if use_curriculum_mask else 100000
+        self.router_warmup_steps = curriculum_start_step if use_curriculum_mask else 5000
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def step(self):
+        """递增训练步数，供 LayerRouter 的温度退火使用。"""
+        self.current_step += 1
+
+    def get_step(self):
+        """获取当前训练步数。"""
+        return self.current_step
+
+    def reset_stream_state(self):
+        """重置流式推理相关的动态状态（双路头 memory/sink 等）。"""
+        for block in self.blocks:
+            if getattr(block, "dual_channel_head", None) is not None:
+                block.dual_channel_head.reset()
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -1413,6 +1595,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                     current_start=current_start,
                     cache_start=cache_start,
                     layer_router=router,
+                    router_step=self.current_step,
+                    router_total_steps=self.router_total_steps,
+                    router_warmup_steps=self.router_warmup_steps,
                 )
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block, block_kwargs),
@@ -1427,6 +1612,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                         "current_start": current_start,
                         "cache_start": cache_start,
                         "layer_router": router,
+                        "router_step": self.current_step,
+                        "router_total_steps": self.router_total_steps,
+                        "router_warmup_steps": self.router_warmup_steps,
                     }
                 )
                 x = block(x, **kwargs)
@@ -1597,14 +1785,27 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         for block_index, block in enumerate(self.blocks):
             router = self.layer_routers[block_index] if self.layer_routers is not None else None
+
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
-                    x, **{**kwargs, "layer_router": router},
+                    x, **{
+                        **kwargs,
+                        "layer_router": router,
+                        "router_step": self.current_step,
+                        "router_total_steps": self.router_total_steps,
+                        "router_warmup_steps": self.router_warmup_steps,
+                    },
                     use_reentrant=False,
                 )
             else:
-                x = block(x, **{**kwargs, "layer_router": router})
+                x = block(x, **{
+                    **kwargs,
+                    "layer_router": router,
+                    "router_step": self.current_step,
+                    "router_total_steps": self.router_total_steps,
+                    "router_warmup_steps": self.router_warmup_steps,
+                })
 
         if clean_x is not None:
             x = x[:, x.shape[1] // 2:]
@@ -1621,6 +1822,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         *args,
         **kwargs
     ):
+        # 训练时的 step 递增由训练管线控制（见 trainer/distillation.py），
+        # 此处仅供推理时不会误增。
         if kwargs.get('kv_cache', None) is not None:
             return self._forward_inference(*args, **kwargs)
         else:

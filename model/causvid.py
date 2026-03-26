@@ -289,25 +289,25 @@ class CausVid(BaseModel):
         # -------------------------------------------------------------------------
         total_loss = dmd_loss
 
-        # 动态获取配置参数（兼容未传参数时的安全回退）
-        use_gumbel_router = getattr(self.args, 'use_gumbel_router', False)
-        use_dual_channel_head = getattr(self.args, 'use_dual_channel_head', False)
+        # 动态获取配置参数（优先从 model_kwargs 读取，兼容旧的顶层配置）
+        model_kwargs = getattr(self.args, "model_kwargs", {}) or {}
+        if isinstance(model_kwargs, dict):
+            use_gumbel_router = model_kwargs.get("use_gumbel_router", getattr(self.args, "use_gumbel_router", False))
+            use_dual_channel_head = model_kwargs.get("use_dual_channel_head", getattr(self.args, "use_dual_channel_head", False))
+        else:
+            use_gumbel_router = getattr(model_kwargs, "use_gumbel_router", getattr(self.args, "use_gumbel_router", False))
+            use_dual_channel_head = getattr(model_kwargs, "use_dual_channel_head", getattr(self.args, "use_dual_channel_head", False))
 
         if use_gumbel_router:
             sparsity_loss = 0.0
             router_count = 0
 
-            # 遍历底层模型的 Transformer block，提取路由器的 Softmax 概率
-            # 注意：self.generator 是 WanDiffusionWrapper，.model 才是 CausalWanModelV2
-            for block in self.generator.model.blocks:
-                if hasattr(block, 'self_attn') and hasattr(block.self_attn, 'layer_router'):
-                    # 获取该层的 logits: shape [2] -> [local_logit, global_logit]
-                    logits = block.self_attn.layer_router.routing_logits
-
-                    # 计算当前层被判定为"全局层 (索引为1)"的平滑概率
-                    probs = torch.nn.functional.softmax(logits, dim=0)
+            # 当 use_gumbel_router=True 时，路由器存储在 model.layer_routers[block_index]
+            if hasattr(self.generator.model, 'layer_routers') and \
+               self.generator.model.layer_routers is not None:
+                for router in self.generator.model.layer_routers:
+                    probs = torch.nn.functional.softmax(router.routing_logits, dim=0)
                     prob_global = probs[1]
-
                     sparsity_loss += prob_global
                     router_count += 1
 

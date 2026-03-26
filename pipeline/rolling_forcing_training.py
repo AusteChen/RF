@@ -38,6 +38,11 @@ class RollingForcingTrainingPipeline:
         self.last_step_only = last_step_only
         self.kv_cache_size = num_max_frames * self.frame_seq_length
 
+    def _reset_stream_state(self):
+        generator = self.generator.module if hasattr(self.generator, "module") else self.generator
+        if hasattr(generator, "reset_stream_state"):
+            generator.reset_stream_state()
+
     def generate_and_sync_list(self, num_blocks, num_denoising_steps, device):
         rank = dist.get_rank() if dist.is_initialized() else 0
 
@@ -106,6 +111,7 @@ class RollingForcingTrainingPipeline:
         self._initialize_crossattn_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
         )
+        self._reset_stream_state()
 
         # implementing rolling forcing 
         # construct the rolling forcing windows
@@ -295,6 +301,7 @@ class RollingForcingTrainingPipeline:
         self._initialize_crossattn_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
         )
+        self._reset_stream_state()
         # if self.kv_cache_clean is None:
         #     self._initialize_kv_cache(
         #         batch_size=batch_size,
@@ -464,7 +471,9 @@ class RollingForcingTrainingPipeline:
                 "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
+                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
 
         self.kv_cache_clean = kv_cache_clean  # always store the clean cache

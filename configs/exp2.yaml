@@ -25,9 +25,9 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
-logdir: /home/adminad/GaoyanTian/log/RF/exp1
-model_save_dir: /home/adminad/GaoyanTian/model/rolling_forcing/exp1
-wandb_save_dir: /home/adminad/GaoyanTian/log/RF/exp1
+logdir: /home/adminad/GaoyanTian/log/RF/exp2
+model_save_dir: /home/adminad/GaoyanTian/model/rolling_forcing/exp2
+wandb_save_dir: /home/adminad/GaoyanTian/log/RF/exp2
 
 data_path: /home/adminad/GaoyanTian/data/prompts/vidprom_filtered_extended.txt
 batch_size: 1
@@ -52,9 +52,9 @@ model_kwargs:
   # 功能 2/3 相关超参数
   local_attn_size: -1
   sink_size: 1
-  use_dual_channel_head: false
+  use_dual_channel_head: true
   use_gumbel_router: false
-  global_layer_indices: null  # use_gumbel_router=true 时会被忽略
+  global_layer_indices: null  # 推荐先用全局层基线；若要硬编码子集，可改成如 [0, 4, 8, 12, 16, 20, 24, 28]
   memory_size: 100
   anchor_frames: 2
   scene_change_tau: 0.6
@@ -69,7 +69,7 @@ decay_mode: linear
 # ========================================
 # 训练控制配置
 # ========================================
-max_steps: 6000  # 训练到指定 step 停止，设为 0 或不设置则不限制
+max_steps: 6000
 
 # ========================================
 # WandB 日志配置
@@ -80,4 +80,4 @@ wandb_host: "https://api.wandb.ai"
 wandb_key: "5073de302aacc34eff42c5304b125048337ec363"
 wandb_entity: auste_t
 wandb_project: rolling_forcing
-wandb_name: exp1
+wandb_name: exp2

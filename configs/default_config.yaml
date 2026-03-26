@@ -18,3 +18,16 @@ num_samples: 1
 height: 480
 width: 832
 num_frames: 81
+logdir: null
+model_save_dir: null
+wandb_save_dir: null
+
+model_kwargs:
+  local_attn_size: -1
+  sink_size: 1
+  use_dual_channel_head: false
+  use_gumbel_router: false
+  global_layer_indices: null
+  memory_size: 100
+  anchor_frames: 2
+  scene_change_tau: 0.6

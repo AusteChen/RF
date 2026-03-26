@@ -18,10 +18,14 @@ SEED=0
 # V2 架构参数（可选）
 # ========================================
 # 方式1: 命令行覆盖配置文件
+# LOCAL_ATTN_SIZE="--local_attn_size 1"
+# SINK_SIZE="--sink_size 1"
 # USE_DUAL_CHANNEL_HEAD="--use_dual_channel_head true"
 # USE_GUMBEL_ROUTER="--use_gumbel_router true"
-# COMPRESSION_RATIO="--compression_ratio 4"
 # GLOBAL_LAYER_INDICES='--global_layer_indices "0,5,10,15"'
+# MEMORY_SIZE="--memory_size 100"
+# ANCHOR_FRAMES="--anchor_frames 2"
+# SCENE_CHANGE_TAU="--scene_change_tau 0.6"
 
 # 方式2: 不设置参数，使用配置文件中定义的值
 # 或者使用空字符串（将使用配置文件默认值）

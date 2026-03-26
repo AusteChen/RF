@@ -29,6 +29,9 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
+logdir: /home/adminad/GaoyanTian/log/RF/exp0a
+model_save_dir: /home/adminad/GaoyanTian/model/rolling_forcing/exp0a
+wandb_save_dir: /home/adminad/GaoyanTian/log/RF/exp0a
 
 data_path: /home/adminad/GaoyanTian/code/RollingForcing/prompts/vidprom_filtered_extended.txt
 batch_size: 1
@@ -50,11 +53,15 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-  # V2 架构参数
+  # 功能 2/3 相关超参数
+  local_attn_size: -1
+  sink_size: 1
   use_dual_channel_head: false
   use_gumbel_router: false
-  compression_ratio: 4
-  # global_layer_indices: [0, 5, 10, 15]  # 可选，硬编码特定层为全局层
+  global_layer_indices: null  # use_gumbel_router=true 时会被忽略
+  memory_size: 100
+  anchor_frames: 2
+  scene_change_tau: 0.6
 
 # ========================================
 # 课程式学习 (Curriculum Learning) 配置
@@ -78,4 +85,3 @@ wandb_key: "5073de302aacc34eff42c5304b125048337ec363"
 wandb_entity: auste_t
 wandb_project: rolling_forcing
 wandb_name: exp0_curriculum_linear
-

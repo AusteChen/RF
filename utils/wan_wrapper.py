@@ -123,7 +123,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             # V2 架构参数
             use_dual_channel_head=False,
             use_gumbel_router=False,
-            compression_ratio=4,
+            memory_size=100,
+            anchor_frames=2,
+            scene_change_tau=0.6,
             global_layer_indices=None,  # 硬编码的全局层索引列表，None表示所有层为全局层
             use_curriculum_mask=False,
             curriculum_total_steps=100000,
@@ -140,7 +142,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                 sink_size=sink_size,
                 use_dual_channel_head=use_dual_channel_head,
                 use_gumbel_router=use_gumbel_router,
-                compression_ratio=compression_ratio,
+                memory_size=memory_size,
+                anchor_frames=anchor_frames,
+                scene_change_tau=scene_change_tau,
                 global_layer_indices=global_layer_indices,
                 use_curriculum_mask=use_curriculum_mask,
                 curriculum_total_steps=curriculum_total_steps,
@@ -351,3 +355,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         We can gradually add more methods here if needed.
         """
         self.get_scheduler()
+
+    def reset_stream_state(self) -> None:
+        if hasattr(self.model, "reset_stream_state"):
+            self.model.reset_stream_state()

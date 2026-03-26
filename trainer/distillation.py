@@ -468,6 +468,8 @@ class Trainer:
                 lookahead_blocks=lookahead_blocks,
                 force_update_mask=force_update_mask,
             )
+            # 每步训练递增模型步数（供 LayerRouter 温度退火使用）
+            self.model.generator.model.step()
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator

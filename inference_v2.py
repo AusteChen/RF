@@ -2,10 +2,14 @@
 V2 Rolling Forcing 推理脚本
 
 支持 V2 架构参数：
+- local_attn_size: 局部层可见的最近历史窗口（按 frame 计）
+- sink_size: 保留在 KV cache 前缀中的 sink 帧数
 - use_dual_channel_head: 双通道历史信息提取头
 - use_gumbel_router: Gumbel-Softmax 门控路由器
-- compression_ratio: 历史信息压缩比
 - global_layer_indices: 硬编码的全局层索引列表（None表示所有层为全局层）
+- memory_size: FIFO 压缩历史长度（按 frame token 计）
+- anchor_frames: 动态 sink 保留的 frame token 数
+- scene_change_tau: 动态 sink 的场景切换阈值
 """
 
 import argparse
@@ -50,14 +54,22 @@ parser.add_argument("--save_with_index", action="store_true",
 # ========================================
 # V2 架构参数（可选，覆盖配置文件）
 # ========================================
+parser.add_argument("--local_attn_size", type=int, default=None,
+                    help="Recent visible history for local layers, measured in frames")
+parser.add_argument("--sink_size", type=int, default=None,
+                    help="Number of sink frames kept in KV cache")
 parser.add_argument("--use_dual_channel_head", type=lambda x: x.lower() == "true", default=None,
                     help="Enable dual channel history extraction head")
 parser.add_argument("--use_gumbel_router", type=lambda x: x.lower() == "true", default=None,
                     help="Enable Gumbel-Softmax router")
-parser.add_argument("--compression_ratio", type=int, default=None,
-                    help="History compression ratio")
 parser.add_argument("--global_layer_indices", type=str, default=None,
                     help="Comma-separated global layer indices, e.g., '0,5,10,15'")
+parser.add_argument("--memory_size", type=int, default=None,
+                    help="FIFO compressed-history length")
+parser.add_argument("--anchor_frames", type=int, default=None,
+                    help="Number of frame tokens kept in the dynamic sink")
+parser.add_argument("--scene_change_tau", type=float, default=None,
+                    help="Scene-change threshold for refreshing the dynamic sink")
 parser.add_argument("--reset_cache", action="store_true", default=False,
                     help="Reset KV cache between samples")
 
@@ -71,15 +83,26 @@ def merge_args_to_config(config, args):
         config.model_kwargs = OmegaConf.create({})
 
     # 覆盖 V2 架构参数
+    if args.local_attn_size is not None:
+        config.model_kwargs.local_attn_size = args.local_attn_size
+    if args.sink_size is not None:
+        config.model_kwargs.sink_size = args.sink_size
     if args.use_dual_channel_head is not None:
         config.model_kwargs.use_dual_channel_head = args.use_dual_channel_head
     if args.use_gumbel_router is not None:
         config.model_kwargs.use_gumbel_router = args.use_gumbel_router
-    if args.compression_ratio is not None:
-        config.model_kwargs.compression_ratio = args.compression_ratio
     if args.global_layer_indices is not None:
         indices = [int(x.strip()) for x in args.global_layer_indices.split(',')]
         config.model_kwargs.global_layer_indices = indices
+    if args.memory_size is not None:
+        config.model_kwargs.memory_size = args.memory_size
+    if args.anchor_frames is not None:
+        config.model_kwargs.anchor_frames = args.anchor_frames
+    if args.scene_change_tau is not None:
+        config.model_kwargs.scene_change_tau = args.scene_change_tau
+
+    if config.model_kwargs.get('use_gumbel_router', False):
+        config.model_kwargs.global_layer_indices = None
 
     return config
 
@@ -113,10 +136,14 @@ print("=" * 60)
 print("V2 Rolling Forcing Inference Configuration")
 print("=" * 60)
 model_kwargs = getattr(config, 'model_kwargs', {})
+print(f"  local_attn_size:       {model_kwargs.get('local_attn_size', -1)}")
+print(f"  sink_size:             {model_kwargs.get('sink_size', 1)}")
 print(f"  use_dual_channel_head: {model_kwargs.get('use_dual_channel_head', False)}")
 print(f"  use_gumbel_router:     {model_kwargs.get('use_gumbel_router', False)}")
-print(f"  compression_ratio:     {model_kwargs.get('compression_ratio', 4)}")
-print(f"  global_layer_indices:   {model_kwargs.get('global_layer_indices', None)}")
+print(f"  global_layer_indices:  {model_kwargs.get('global_layer_indices', None)}")
+print(f"  memory_size:           {model_kwargs.get('memory_size', 100)}")
+print(f"  anchor_frames:         {model_kwargs.get('anchor_frames', 2)}")
+print(f"  scene_change_tau:      {model_kwargs.get('scene_change_tau', 0.6)}")
 if model_kwargs.get('global_layer_indices') is None and not model_kwargs.get('use_gumbel_router', False):
     print("  (Default: all layers are global layers)")
 print("=" * 60)

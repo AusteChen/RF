@@ -46,6 +46,11 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+    def _reset_stream_state(self):
+        generator = self.generator.module if hasattr(self.generator, "module") else self.generator
+        if hasattr(generator, "reset_stream_state"):
+            generator.reset_stream_state()
+
     def inference(
         self,
         noise: torch.Tensor,
@@ -97,6 +102,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
 
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache_pos is None:
+            self._reset_stream_state()
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=noise.dtype,
@@ -108,6 +114,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 device=noise.device
             )
         else:
+            self._reset_stream_state()
             # reset cross attn cache
             for block_index in range(self.num_transformer_blocks):
                 self.crossattn_cache_pos[block_index]["is_init"] = False
@@ -118,10 +125,18 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_pos[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                self.kv_cache_pos[block_index]["evicted_k"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
+                self.kv_cache_pos[block_index]["evicted_v"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
                 self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                self.kv_cache_neg[block_index]["evicted_k"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
+                self.kv_cache_neg[block_index]["evicted_v"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -285,13 +300,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
+                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
             kv_cache_neg.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
+                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache

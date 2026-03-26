@@ -42,6 +42,11 @@ class CausalInferencePipeline(torch.nn.Module):
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
+    def _reset_stream_state(self):
+        generator = self.generator.module if hasattr(self.generator, "module") else self.generator
+        if hasattr(generator, "reset_stream_state"):
+            generator.reset_stream_state()
+
     def inference_rolling_forcing(
         self,
         noise: torch.Tensor,
@@ -103,6 +108,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
         # Step 1: Initialize KV cache to all zeros
         if self.kv_cache_clean is None:
+            self._reset_stream_state()
             self._initialize_kv_cache(
                 batch_size=batch_size,
                 dtype=noise.dtype,
@@ -114,6 +120,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 device=noise.device
             )
         else:
+            self._reset_stream_state()
             # reset cross attn cache
             for block_index in range(self.num_transformer_blocks):
                 self.crossattn_cache[block_index]["is_init"] = False
@@ -123,10 +130,15 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_clean[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+                self.kv_cache_clean[block_index]["evicted_k"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
+                self.kv_cache_clean[block_index]["evicted_v"] = torch.zeros(
+                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
 
         # Step 2: Cache context feature
         if initial_latent is not None:
             timestep = torch.ones([batch_size, 1], device=noise.device, dtype=torch.int64) * 0
+            current_start_frame = 0
             if self.independent_first_frame:
                 # Assume num_input_frames is 1 + self.num_frame_per_block * num_input_blocks
                 assert (num_input_frames - 1) % self.num_frame_per_block == 0
@@ -352,7 +364,10 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                # evicted tokens 用于双通道历史提取头的通道二
+                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
+                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
 
         self.kv_cache_clean = kv_cache_clean  # always store the clean cache
