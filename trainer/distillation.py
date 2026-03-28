@@ -403,7 +403,7 @@ class Trainer:
             if not state_dict:
                 return 0
             return sum(
-                ("dual_channel_head" in k) or ("layer_routers" in k)
+                ("dynamic_anchor_head" in k) or ("layer_classifiers" in k)
                 for k in state_dict.keys()
             )
 
@@ -491,7 +491,7 @@ class Trainer:
             os.rename(tmp_path, last_path)
             ema_tag = " (+EMA)" if ema_sd is not None else " (EMA not started yet)"
             arch_key_count = sum(
-                ("dual_channel_head" in k) or ("layer_routers" in k)
+                ("dynamic_anchor_head" in k) or ("layer_classifiers" in k)
                 for k in gen_sd.keys()
             )
             print(f"[Save] Resume ckpt -> {last_path}{ema_tag} | arch_keys={arch_key_count}")
@@ -517,7 +517,16 @@ class Trainer:
     # -----------------------------------------------------------------------
 
     def fwdbwd_one_step(self, batch, train_generator):
-        self.model.eval()
+        self.model.real_score.eval()
+        self.model.text_encoder.eval()
+        if hasattr(self.model.vae, "eval"):
+            self.model.vae.eval()
+        if train_generator:
+            self.model.generator.train()
+            self.model.fake_score.eval()
+        else:
+            self.model.generator.eval()
+            self.model.fake_score.train()
 
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
@@ -569,7 +578,7 @@ class Trainer:
                 unconditional_dict = self.unconditional_dict
 
         if train_generator:
-            generator_loss, generator_log_dict = self.model.generator_loss(
+            generator_main_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
@@ -578,16 +587,24 @@ class Trainer:
                 lookahead_blocks=lookahead_blocks,
                 force_update_mask=force_update_mask,
             )
-            # 每步训练递增模型步数（供 LayerRouter 温度退火使用）
-            self.model.generator.model.step()
+
+            layer_reg_loss, layer_reg_stats = self._compute_layer_regularization()
+            generator_loss = generator_main_loss
+            if layer_reg_loss is not None:
+                generator_loss = generator_loss + layer_reg_loss
+                generator_log_dict.update(layer_reg_stats)
+
             generator_loss.backward()
             generator_grad_norm = self.model.generator.clip_grad_norm_(
                 self.max_grad_norm_generator
             )
             generator_log_dict.update({
                 "generator_loss":      generator_loss,
+                "generator_main_loss": generator_main_loss.detach(),
                 "generator_grad_norm": generator_grad_norm,
             })
+            if layer_reg_loss is not None:
+                generator_log_dict["layer_classifier/regularized_total_loss"] = generator_loss.detach()
             return generator_log_dict
 
         critic_loss, critic_log_dict = self.model.critic_loss(
@@ -652,6 +669,62 @@ class Trainer:
                     "dmdtrain_pred_real_image", "dmdtrain_pred_fake_image"):
             if key in generator_log_dict:
                 _decode_and_upload(generator_log_dict[key], key)
+
+    def _get_causal_generator_backbone(self):
+        generator = self.model.generator
+        if hasattr(generator, "module"):
+            generator = generator.module
+        return getattr(generator, "model", None)
+
+    def _compute_layer_regularization(self):
+        backbone = self._get_causal_generator_backbone()
+        if backbone is None or not hasattr(backbone, "get_layer_classification_regularizer"):
+            return None, {}
+
+        ratio_weight = getattr(self.config, "layer_ratio_loss_weight", 0.0)
+        return backbone.get_layer_classification_regularizer(
+            ratio_weight=ratio_weight,
+        )
+
+    def _collect_generator_arch_stats(self):
+        backbone = self._get_causal_generator_backbone()
+        if backbone is None or not hasattr(backbone, "blocks"):
+            return {}, {}
+
+        stats = {}
+        text_stats = {}
+        stats["layer_classifier/auto_classification_active"] = 1.0 if getattr(backbone, "latest_layer_global_probs", None) is not None else 0.0
+        global_probs = []
+        anchor_switches = []
+        anchor_lengths = []
+        anchor_similarities = []
+
+        for block_idx, block in enumerate(backbone.blocks):
+            if getattr(block, "last_global_prob", None) is not None:
+                prob_value = float(block.last_global_prob)
+                global_probs.append(prob_value)
+                stats[f"layer_classifier/prob_global_l{block_idx:02d}"] = prob_value
+
+            anchor_head = getattr(block, "dynamic_anchor_head", None)
+            if anchor_head is not None:
+                anchor_switches.append(float(anchor_head.last_is_scene_change))
+                anchor_lengths.append(float(anchor_head.last_anchor_length))
+                if anchor_head.last_similarity is not None:
+                    anchor_similarities.append(float(anchor_head.last_similarity))
+
+        if global_probs:
+            stats["layer_classifier/prob_global_mean_runtime"] = float(np.mean(global_probs))
+            current_global_indices = [str(idx) for idx, prob in enumerate(global_probs) if prob >= 0.5]
+            stats["layer_classifier/global_layer_count_runtime"] = float(len(current_global_indices))
+            text_stats["layer_classifier/current_global_layers"] = ",".join(current_global_indices) if current_global_indices else "none"
+
+        if anchor_switches:
+            stats["dynamic_anchor/scene_change_rate"] = float(np.mean(anchor_switches))
+            stats["dynamic_anchor/anchor_blocks_mean"] = float(np.mean(anchor_lengths))
+        if anchor_similarities:
+            stats["dynamic_anchor/block_similarity_mean"] = float(np.mean(anchor_similarities))
+
+        return stats, text_stats
 
     # -----------------------------------------------------------------------
     # 主训练循环
@@ -725,12 +798,31 @@ class Trainer:
                         "generator_grad_norm":    g_gnorm,
                         "dmdtrain_gradient_norm": g_dmd,
                     })
-                    if "router_global_prob_mean" in generator_log_dict:
-                        wandb_log["router_global_prob_mean"] = \
-                            generator_log_dict["router_global_prob_mean"].mean().item()
-                    if "router_sparsity_loss" in generator_log_dict:
-                        wandb_log["router_sparsity_loss"] = \
-                            generator_log_dict["router_sparsity_loss"].mean().item()
+                    if "generator_main_loss" in generator_log_dict:
+                        g_main = generator_log_dict["generator_main_loss"].mean().item()
+                        self.writer.add_scalar("generator_main_loss", g_main, self.step)
+                        wandb_log["generator_main_loss"] = g_main
+                    if "layer_classifier/regularization_loss" in generator_log_dict:
+                        reg_loss = generator_log_dict["layer_classifier/regularization_loss"].mean().item()
+                        self.writer.add_scalar("layer_classifier/regularization_loss", reg_loss, self.step)
+                        wandb_log["layer_classifier/regularization_loss"] = reg_loss
+                    for key, value in generator_log_dict.items():
+                        if not key.startswith("layer_classifier/") or key == "layer_classifier/regularization_loss":
+                            continue
+                        if torch.is_tensor(value):
+                            value = value.mean().item()
+                        elif not isinstance(value, (int, float)):
+                            continue
+                        self.writer.add_scalar(key, value, self.step)
+                        wandb_log[key] = value
+
+                    arch_stats, arch_text_stats = self._collect_generator_arch_stats()
+                    for key, value in arch_stats.items():
+                        self.writer.add_scalar(key, value, self.step)
+                    wandb_log.update(arch_stats)
+                    for key, value in arch_text_stats.items():
+                        self.writer.add_text(key, value, self.step)
+                    wandb_log.update(arch_text_stats)
 
                 # --- 课程式 mask 参数 ---
                 if self.use_curriculum:

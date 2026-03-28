@@ -1,7 +1,6 @@
 import torch.nn.functional as F
 from typing import Tuple
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from model.base import BaseModel
 
@@ -44,18 +43,6 @@ class CausVid(BaseModel):
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
         else:
             self.scheduler.alphas_cumprod = None
-
-    def _collect_router_logits(self):
-        def _read_router_logits():
-            routers = getattr(self.generator.model, "layer_routers", None)
-            if routers is None:
-                return []
-            return [router.routing_logits.float().clone() for router in routers if router.routing_logits.numel() >= 2]
-
-        if isinstance(self.generator, FSDP):
-            with FSDP.summon_full_params(self.generator, writeback=False):
-                return _read_router_logits()
-        return _read_router_logits()
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
@@ -297,49 +284,7 @@ class CausVid(BaseModel):
             denoised_timestep_to=denoised_timestep_to
         )
 
-        # -------------------------------------------------------------------------
-        # Step 3: Architecture-specific Losses (Gumbel Router Sparsity Penalty)
-        # -------------------------------------------------------------------------
-        total_loss = dmd_loss
-
-        # 动态获取配置参数（优先从 model_kwargs 读取，兼容旧的顶层配置）
-        model_kwargs = getattr(self.args, "model_kwargs", {}) or {}
-        if isinstance(model_kwargs, dict):
-            use_gumbel_router = model_kwargs.get("use_gumbel_router", getattr(self.args, "use_gumbel_router", False))
-            use_dual_channel_head = model_kwargs.get("use_dual_channel_head", getattr(self.args, "use_dual_channel_head", False))
-        else:
-            use_gumbel_router = getattr(model_kwargs, "use_gumbel_router", getattr(self.args, "use_gumbel_router", False))
-            use_dual_channel_head = getattr(model_kwargs, "use_dual_channel_head", getattr(self.args, "use_dual_channel_head", False))
-
-        if use_gumbel_router:
-            sparsity_loss = 0.0
-            router_count = 0
-
-            # 当 use_gumbel_router=True 时，路由器存储在 model.layer_routers[block_index]
-            for logits in self._collect_router_logits():
-                probs = torch.nn.functional.softmax(logits, dim=0)
-                prob_global = probs[1]
-                sparsity_loss += prob_global
-                router_count += 1
-
-            if router_count > 0:
-                sparsity_loss = sparsity_loss / router_count  # 取所有层的平均全局概率
-
-                # 获取稀疏性权重，建议在 yaml 中设置为 0.05 到 0.1 之间
-                lambda_sparsity = getattr(self.args, 'router_sparsity_weight', 0.05)
-
-                # 将稀疏性惩罚加入总 Loss
-                total_loss = total_loss + lambda_sparsity * sparsity_loss
-
-                # 记录到日志，极度方便你在 WandB/Tensorboard 监控层被剪枝的过程
-                dmd_log_dict["router_global_prob_mean"] = sparsity_loss.detach()
-                dmd_log_dict["router_sparsity_loss"] = (lambda_sparsity * sparsity_loss).detach()
-
-        # 注意：双通道提取头 (use_dual_channel_head) 无需显式 Loss。
-        # 它的计算是完全可微的，梯度的反向传播会自然地流经通道内的 mean pooling
-        # 和 torch.cat，引导前序层学习出更好的、不易漂移的时空表征。
-
-        return total_loss, dmd_log_dict
+        return dmd_loss, dmd_log_dict
 
     def critic_loss(
         self,

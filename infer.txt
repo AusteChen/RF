@@ -28,7 +28,7 @@ torchrun --nproc_per_node=8 \
   --rdzv_backend=c10d \
   --rdzv_endpoint 127.0.0.1:29500 \
   train.py -- \
-  --config_path /home/adminad/GaoyanTian/code/RollingForcing/configs/exp0_curriculum_cosine.yaml \
+  --config_path /home/adminad/GaoyanTian/code/RollingForcing/configs/exp0_cosine.yaml \
   --logdir /home/adminad/GaoyanTian/log/RF/exp0b \
   --model-save-dir /home/adminad/GaoyanTian/model/rolling_forcing/exp0b \
   --wandb-save-dir /home/adminad/GaoyanTian/log/RF/exp0b \

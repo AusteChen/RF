@@ -49,14 +49,14 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-  # 功能 2/3 相关超参数
   local_attn_size: -1
   sink_size: 1
-  use_dual_channel_head: true
-  use_gumbel_router: false
-  global_layer_indices: null  # 推荐先用全局层基线；若要硬编码子集，可改成如 [0, 4, 8, 12, 16, 20, 24, 28]
-  memory_size: 100
-  anchor_frames: 2
+  use_dynamic_anchor: true
+  use_layer_specialization: false
+  use_auto_layer_classification: false
+  global_layer_indices: null
+  local_history_blocks: 2
+  anchor_blocks: 1
   scene_change_tau: 0.6
 
 # ========================================

@@ -47,18 +47,19 @@ trainer: score_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
-router_sparsity_weight: 0.05
 model_kwargs:
   timestep_shift: 5.0
-  # 功能 2/3 相关超参数
   local_attn_size: -1
   sink_size: 1
-  use_dual_channel_head: true
-  use_gumbel_router: true
-  global_layer_indices: null  # router 模式下会被忽略
-  memory_size: 100
-  anchor_frames: 2
+  use_dynamic_anchor: false
+  use_layer_specialization: true
+  use_auto_layer_classification: true
+  global_layer_indices: [0, 4, 8, 12, 16, 20, 24, 28]
+  local_history_blocks: 2
+  anchor_blocks: 1
   scene_change_tau: 0.6
+
+layer_ratio_loss_weight: 0.05
 
 # ========================================
 # 课程式学习 (Curriculum Learning) 配置

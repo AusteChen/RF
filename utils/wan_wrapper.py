@@ -120,13 +120,13 @@ class WanDiffusionWrapper(torch.nn.Module):
             is_causal=False,
             local_attn_size=-1,
             sink_size=0,
-            # V2 架构参数
-            use_dual_channel_head=False,
-            use_gumbel_router=False,
-            memory_size=100,
-            anchor_frames=2,
+            use_dynamic_anchor=False,
+            use_layer_specialization=False,
+            use_auto_layer_classification=False,
+            anchor_blocks=1,
             scene_change_tau=0.6,
-            global_layer_indices=None,  # 硬编码的全局层索引列表，None表示所有层为全局层
+            global_layer_indices=None,
+            local_history_blocks=2,
             use_curriculum_mask=False,
             curriculum_total_steps=100000,
             curriculum_start_step=5000,
@@ -135,17 +135,17 @@ class WanDiffusionWrapper(torch.nn.Module):
         super().__init__()
 
         if is_causal:
-            # 使用原始 CausalWanModel，现在支持 V2 参数
             self.model = CausalWanModel.from_pretrained(
                 f"/home/adminad/GaoyanTian/model/wan_models/{model_name}/",
                 local_attn_size=local_attn_size,
                 sink_size=sink_size,
-                use_dual_channel_head=use_dual_channel_head,
-                use_gumbel_router=use_gumbel_router,
-                memory_size=memory_size,
-                anchor_frames=anchor_frames,
+                use_dynamic_anchor=use_dynamic_anchor,
+                use_layer_specialization=use_layer_specialization,
+                use_auto_layer_classification=use_auto_layer_classification,
+                anchor_blocks=anchor_blocks,
                 scene_change_tau=scene_change_tau,
                 global_layer_indices=global_layer_indices,
+                local_history_blocks=local_history_blocks,
                 use_curriculum_mask=use_curriculum_mask,
                 curriculum_total_steps=curriculum_total_steps,
                 curriculum_start_step=curriculum_start_step,

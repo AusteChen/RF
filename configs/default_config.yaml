@@ -9,6 +9,7 @@ num_training_frames: 27
 gc_interval: 100
 context_noise: 0
 causal: true
+layer_ratio_loss_weight: 0.0
 
 ckpt_step: 0
 prompt_name: MovieGenVideoBench
@@ -25,9 +26,10 @@ wandb_save_dir: null
 model_kwargs:
   local_attn_size: -1
   sink_size: 1
-  use_dual_channel_head: false
-  use_gumbel_router: false
+  use_dynamic_anchor: false
+  use_layer_specialization: false
+  use_auto_layer_classification: false
   global_layer_indices: null
-  memory_size: 100
-  anchor_frames: 2
+  local_history_blocks: 2
+  anchor_blocks: 1
   scene_change_tau: 0.6

@@ -1,7 +1,3 @@
-# 实验0a：课程式 mask 衰减对比 —— Cosine
-# Exp0b: Curriculum mask decay comparison -- Cosine
-# 目的：与 exp0_linear.yaml 对比，确定最优衰减曲线
-# 转化步数 = 总训练步数 = 2000（完整走完从双向到因果的过渡）
 generator_ckpt: /home/adminad/GaoyanTian/model/wan1_3b_ptver/model.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
@@ -29,11 +25,11 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
-logdir: /home/adminad/GaoyanTian/log/RF/exp0b
-model_save_dir: /home/adminad/GaoyanTian/model/rolling_forcing/exp0b
-wandb_save_dir: /home/adminad/GaoyanTian/log/RF/exp0b
+logdir: /home/adminad/GaoyanTian/log/RF/exp0
+model_save_dir: /home/adminad/GaoyanTian/model/rolling_forcing/exp0
+wandb_save_dir: /home/adminad/GaoyanTian/log/RF/exp0
 
-data_path: /home/adminad/GaoyanTian/code/RollingForcing/prompts/vidprom_filtered_extended.txt
+data_path: /home/adminad/GaoyanTian/data/prompts/vidprom_filtered_extended.txt
 batch_size: 1
 ema_weight: 0.99
 ema_start_step: 200
@@ -53,35 +49,26 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-  # 功能 2/3 相关超参数
   local_attn_size: -1
   sink_size: 1
-  use_dual_channel_head: false
-  use_gumbel_router: false
-  global_layer_indices: null  # use_gumbel_router=true 时会被忽略
-  memory_size: 100
-  anchor_frames: 2
+  use_dynamic_anchor: false
+  use_layer_specialization: false
+  use_auto_layer_classification: false
+  global_layer_indices: null
+  local_history_blocks: 2
+  anchor_blocks: 1
   scene_change_tau: 0.6
 
-# ========================================
-# 课程式学习 (Curriculum Learning) 配置
-# ========================================
 use_curriculum: true
 transition_steps: 2000
-decay_mode: cosine
+decay_mode: linear
 
-# ========================================
-# 训练控制配置
-# ========================================
-max_steps: 2000  # 训练到指定 step 停止，设为 0 或不设置则不限制
+max_steps: 6000
 
-# ========================================
-# WandB 日志配置
-# ========================================
 log_iters: 100
 save_interval: 500
 wandb_host: "https://api.wandb.ai"
 wandb_key: "5073de302aacc34eff42c5304b125048337ec363"
 wandb_entity: auste_t
 wandb_project: rolling_forcing
-wandb_name: exp0_curriculum_cosine
+wandb_name: exp0

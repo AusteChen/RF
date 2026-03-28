@@ -125,18 +125,10 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_pos[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_pos[block_index]["evicted_k"] = torch.zeros(
-                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
-                self.kv_cache_pos[block_index]["evicted_v"] = torch.zeros(
-                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
                 self.kv_cache_neg[block_index]["global_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_neg[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
-                self.kv_cache_neg[block_index]["evicted_k"] = torch.zeros(
-                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
-                self.kv_cache_neg[block_index]["evicted_v"] = torch.zeros(
-                    [batch_size, 0, 12, 128], dtype=noise.dtype, device=noise.device)
 
         # Step 2: Cache context feature
         current_start_frame = start_frame_index
@@ -301,16 +293,12 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
-                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
             kv_cache_neg.append({
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "evicted_k": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
-                "evicted_v": torch.zeros([batch_size, 0, 12, 128], dtype=dtype, device=device),
             })
 
         self.kv_cache_pos = kv_cache_pos  # always store the clean cache

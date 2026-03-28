@@ -4,7 +4,7 @@
 # ========================================
 
 # 配置参数
-CONFIG_PATH="/home/adminad/GaoyanTian/code/RollingForcing/configs/exp0_curriculum_linear.yaml"
+CONFIG_PATH="/home/adminad/GaoyanTian/code/RollingForcing/configs/exp0_linear.yaml"
 CHECKPOINT_PATH="/home/adminad/GaoyanTian/model/rolling_forcing/exp0a/checkpoint_latest.pt"
 DATA_PATH="/home/adminad/GaoyanTian/code/RollingForcing/prompts/prompt.txt"
 OUTPUT_FOLDER="/home/adminad/GaoyanTian/tmp/rf-videos/inference_v2"
@@ -20,19 +20,23 @@ SEED=0
 # 方式1: 命令行覆盖配置文件
 # LOCAL_ATTN_SIZE="--local_attn_size 1"
 # SINK_SIZE="--sink_size 1"
-# USE_DUAL_CHANNEL_HEAD="--use_dual_channel_head true"
-# USE_GUMBEL_ROUTER="--use_gumbel_router true"
+# USE_DYNAMIC_ANCHOR="--use_dynamic_anchor true"
+# USE_LAYER_SPECIALIZATION="--use_layer_specialization true"
+# USE_AUTO_LAYER_CLASSIFICATION="--use_auto_layer_classification true"
 # GLOBAL_LAYER_INDICES='--global_layer_indices "0,5,10,15"'
-# MEMORY_SIZE="--memory_size 100"
-# ANCHOR_FRAMES="--anchor_frames 2"
+# LOCAL_HISTORY_BLOCKS="--local_history_blocks 2"
+# ANCHOR_BLOCKS="--anchor_blocks 1"
 # SCENE_CHANGE_TAU="--scene_change_tau 0.6"
 
 # 方式2: 不设置参数，使用配置文件中定义的值
 # 或者使用空字符串（将使用配置文件默认值）
-USE_DUAL_CHANNEL_HEAD=""
-USE_GUMBEL_ROUTER=""
-COMPRESSION_RATIO=""
+USE_DYNAMIC_ANCHOR=""
+USE_LAYER_SPECIALIZATION=""
+USE_AUTO_LAYER_CLASSIFICATION=""
 GLOBAL_LAYER_INDICES=""
+LOCAL_HISTORY_BLOCKS=""
+ANCHOR_BLOCKS=""
+SCENE_CHANGE_TAU=""
 
 # 创建输出目录
 mkdir -p "$OUTPUT_FOLDER"
@@ -41,7 +45,7 @@ mkdir -p "$OUTPUT_FOLDER"
 torchrun --nproc_per_node=8 \
   --rdzv_backend=c10d \
   --rdzv_endpoint 127.0.0.1:29500 \
-  inference_v2.py -- \
+  inference.py -- \
   --config_path "$CONFIG_PATH" \
   --checkpoint_path "$CHECKPOINT_PATH" \
   --data_path "$DATA_PATH" \
@@ -49,8 +53,11 @@ torchrun --nproc_per_node=8 \
   --num_output_frames $NUM_OUTPUT_FRAMES \
   --num_samples $NUM_SAMPLES \
   --seed $SEED \
-  $USE_DUAL_CHANNEL_HEAD \
-  $USE_GUMBEL_ROUTER \
-  $COMPRESSION_RATIO \
+  $USE_DYNAMIC_ANCHOR \
+  $USE_LAYER_SPECIALIZATION \
+  $USE_AUTO_LAYER_CLASSIFICATION \
   $GLOBAL_LAYER_INDICES \
+  $LOCAL_HISTORY_BLOCKS \
+  $ANCHOR_BLOCKS \
+  $SCENE_CHANGE_TAU \
   2>&1 | tee "$OUTPUT_FOLDER/inference.log"
