@@ -32,9 +32,9 @@ torchrun --nproc_per_node=8 \
   --logdir /home/adminad/GaoyanTian/log/RF/exp0b \
   --model-save-dir /home/adminad/GaoyanTian/model/rolling_forcing/exp0b \
   --wandb-save-dir /home/adminad/GaoyanTian/log/RF/exp0b \
-  2>&1 | tee /home/adminad/GaoyanTian/log/RF/exp0b/train.log
+  2>&1 | tee /home/adminad/GaoyanTian/log/RF/exp3/train.log
 
-  --resume /home/adminad/GaoyanTian/model/rolling_forcing/exp1/checkpoint_last.pt
+  --resume /home/adminad/GaoyanTian/model/rolling_forcing/exp3/checkpoint_last.pt
 
 cd /home/adminad/GaoyanTian/code/RollingForcing && \
 mkdir -p /home/adminad/GaoyanTian/data/Openvid-res/rf_exp0a && \

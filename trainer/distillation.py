@@ -93,19 +93,25 @@ class Trainer:
         # 断点续训：预读取 checkpoint，获取 step 和 wandb_id
         # ------------------------------------------------------------------
         self._resume_ckpt = None
-        wandb_resume_id = None
+        self._resume_ema_state = None
+        self._resume_ckpt_step = None
+        self._resume_wandb_id = None
 
         if self.resume_path:
             if self.is_main_process:
                 print(f"[Resume] Loading checkpoint: {self.resume_path}")
             ckpt = torch.load(self.resume_path, map_location="cpu", weights_only=False)
             self._resume_ckpt = ckpt
-            self.step = ckpt.get("step", 0) + 1
-            wandb_resume_id = ckpt.get("wandb_id", None)
+            self._resume_ema_state = ckpt.get("generator_ema", None)
+            self._resume_ckpt_step = ckpt.get("step", 0)
+            self._resume_wandb_id = ckpt.get("wandb_id", None)
+            self.step = self._resume_ckpt_step + 1
             if self.is_main_process:
-                print(f"[Resume] step={self.step}, wandb_id={wandb_resume_id}")
+                print(f"[Resume] step={self.step}, ckpt_step={self._resume_ckpt_step}, "
+                      f"wandb_id={self._resume_wandb_id}")
         else:
             self.step = 0
+
 
         # 随机种子
         if config.seed == 0:
@@ -128,21 +134,25 @@ class Trainer:
                 wandb_key = getattr(config, "wandb_key", None)
                 if wandb_key:
                     wandb.login(key=wandb_key)
+
+                run_name, run_id, resume_mode = self._resolve_wandb_resume()
                 wandb_kwargs = dict(
                     project=getattr(config, "wandb_project", "rolling_forcing"),
                     entity=getattr(config, "wandb_entity", None),
-                    name=getattr(config, "wandb_name",
-                                 getattr(config, "config_name", "experiment")),
+                    name=run_name,
                     dir=getattr(config, "wandb_save_dir", config.logdir),
                     config={k: v for k, v in config.items()
                             if not callable(v) and not k.startswith("_")},
                 )
-                if wandb_resume_id:
-                    wandb_kwargs["id"] = wandb_resume_id
-                    wandb_kwargs["resume"] = "allow"
+                if run_id is not None:
+                    wandb_kwargs["id"] = run_id
+                if resume_mode is not None:
+                    wandb_kwargs["resume"] = resume_mode
+
                 wandb.init(**wandb_kwargs)
                 print(f"[WandB] project={wandb_kwargs['project']}, "
-                      f"resume_id={wandb_resume_id}")
+                      f"run_name={run_name}, run_id={run_id}, resume_mode={resume_mode}")
+
 
         # log 目录：TensorBoard、WandB 日志
         self.log_path = config.logdir
@@ -289,6 +299,10 @@ class Trainer:
         if (ema_weight is not None) and (ema_weight > 0.0):
             print(f"[EMA] decay={ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            if self._resume_ema_state is not None:
+                self.generator_ema.load_state_dict(self._resume_ema_state)
+                if self.is_main_process:
+                    print("[Resume] EMA state restored.")
         if self.step < config.ema_start_step:
             self.generator_ema = None
 
@@ -299,13 +313,104 @@ class Trainer:
     # -----------------------------------------------------------------------
     # 断点续训：加载权重 + 优化器 + RNG
     # -----------------------------------------------------------------------
+    def _get_wandb_base_name(self):
+        return getattr(
+            self.config,
+            "wandb_name",
+            getattr(self.config, "config_name", "experiment")
+        )
+
+    def _resolve_wandb_resume(self):
+        """
+        返回:
+            run_name: 当前 run 名称
+            run_id:   wandb run id（可为 None）
+            resume_mode: "allow" / "never" / None
+        规则:
+            - always: 永远复用 checkpoint 中的 wandb_id
+            - never:  永远创建新 run
+            - auto:   若 checkpoint step 与远程 wandb run 的 _step 一致，则复用；
+                      否则创建新 run
+        """
+        base_name = self._get_wandb_base_name()
+        policy = getattr(self.config, "wandb_resume_policy", "auto")
+        if policy not in {"auto", "always", "never"}:
+            raise ValueError(f"Invalid wandb_resume_policy: {policy}")
+
+        # 非续训：正常新建 run
+        if not self.resume_path:
+            return base_name, None, None
+
+        ckpt_step = self._resume_ckpt_step
+        ckpt_wandb_id = self._resume_wandb_id
+
+        # checkpoint 里没有 wandb_id：只能新建 run
+        if not ckpt_wandb_id:
+            new_id = wandb.util.generate_id()
+            new_name = f"{base_name}_resume_step_{self.step}"
+            if self.is_main_process:
+                print(f"[WandB] No wandb_id found in checkpoint. Start new run: {new_name} ({new_id})")
+            return new_name, new_id, "never"
+
+        # 强制复用旧 run
+        if policy == "always":
+            if self.is_main_process:
+                print(f"[WandB] Resume existing run (policy=always): id={ckpt_wandb_id}")
+            return base_name, ckpt_wandb_id, "allow"
+
+        # 强制新建 run
+        if policy == "never":
+            new_id = wandb.util.generate_id()
+            new_name = f"{base_name}_resume_step_{self.step}"
+            if self.is_main_process:
+                print(f"[WandB] Start new run (policy=never): {new_name} ({new_id})")
+            return new_name, new_id, "never"
+
+        # policy == auto
+        entity = getattr(self.config, "wandb_entity", None)
+        project = getattr(self.config, "wandb_project", "rolling_forcing")
+
+        remote_step = None
+        try:
+            if entity is not None:
+                api = wandb.Api()
+                old_run = api.run(f"{entity}/{project}/{ckpt_wandb_id}")
+                remote_step = old_run.summary.get("_step", None)
+        except Exception as e:
+            if self.is_main_process:
+                print(f"[WandB] Failed to inspect remote run step for id={ckpt_wandb_id}: {e}")
+
+        # 只有远程 step 和 checkpoint step 完全一致时才复用旧 run
+        if remote_step is not None and remote_step == ckpt_step:
+            if self.is_main_process:
+                print(f"[WandB] Resume existing run (policy=auto): id={ckpt_wandb_id}, "
+                      f"remote_step={remote_step}, ckpt_step={ckpt_step}")
+            return base_name, ckpt_wandb_id, "allow"
+
+        new_id = wandb.util.generate_id()
+        new_name = f"{base_name}_resume_step_{self.step}"
+        if self.is_main_process:
+            print(f"[WandB] Start new run (policy=auto): "
+                  f"remote_step={remote_step}, ckpt_step={ckpt_step}, "
+                  f"name={new_name}, id={new_id}")
+        return new_name, new_id, "never"
 
     def _load_checkpoint_state(self, ckpt):
         if self.is_main_process:
             print("[Resume] Restoring weights, optimizers and RNG...")
         fsdp_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        def _count_arch_keys(state_dict):
+            if not state_dict:
+                return 0
+            return sum(
+                ("dual_channel_head" in k) or ("layer_routers" in k)
+                for k in state_dict.keys()
+            )
 
         if "generator" in ckpt:
+            if self.is_main_process:
+                arch_key_count = _count_arch_keys(ckpt["generator"])
+                print(f"[Resume] Generator checkpoint arch keys: {arch_key_count}")
             with FSDP.state_dict_type(
                 self.model.generator, StateDictType.FULL_STATE_DICT, fsdp_cfg
             ):
@@ -385,7 +490,12 @@ class Trainer:
                 os.remove(last_path)
             os.rename(tmp_path, last_path)
             ema_tag = " (+EMA)" if ema_sd is not None else " (EMA not started yet)"
-            print(f"[Save] Resume ckpt -> {last_path}{ema_tag}")
+            arch_key_count = sum(
+                ("dual_channel_head" in k) or ("layer_routers" in k)
+                for k in gen_sd.keys()
+            )
+            print(f"[Save] Resume ckpt -> {last_path}{ema_tag} | arch_keys={arch_key_count}")
+
 
             # ---- 轻量历史快照（仅权重，推理用）----
             if (not self.config.no_save) and (

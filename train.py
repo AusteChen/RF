@@ -23,6 +23,12 @@ def main():
     default_config = OmegaConf.load("configs/default_config.yaml")
     config = OmegaConf.merge(default_config, config)
 
+    if args.resume is not None:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        # 续训时必须以 resume checkpoint 为准，不能再回退加载 base generator ckpt。
+        config.generator_ckpt = None
+
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
     config.config_name = os.path.basename(args.config_path).split(".")[0]

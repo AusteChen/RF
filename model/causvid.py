@@ -1,6 +1,7 @@
 import torch.nn.functional as F
 from typing import Tuple
 import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from model.base import BaseModel
 
@@ -43,6 +44,18 @@ class CausVid(BaseModel):
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
         else:
             self.scheduler.alphas_cumprod = None
+
+    def _collect_router_logits(self):
+        def _read_router_logits():
+            routers = getattr(self.generator.model, "layer_routers", None)
+            if routers is None:
+                return []
+            return [router.routing_logits.float().clone() for router in routers if router.routing_logits.numel() >= 2]
+
+        if isinstance(self.generator, FSDP):
+            with FSDP.summon_full_params(self.generator, writeback=False):
+                return _read_router_logits()
+        return _read_router_logits()
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
@@ -303,13 +316,11 @@ class CausVid(BaseModel):
             router_count = 0
 
             # 当 use_gumbel_router=True 时，路由器存储在 model.layer_routers[block_index]
-            if hasattr(self.generator.model, 'layer_routers') and \
-               self.generator.model.layer_routers is not None:
-                for router in self.generator.model.layer_routers:
-                    probs = torch.nn.functional.softmax(router.routing_logits, dim=0)
-                    prob_global = probs[1]
-                    sparsity_loss += prob_global
-                    router_count += 1
+            for logits in self._collect_router_logits():
+                probs = torch.nn.functional.softmax(logits, dim=0)
+                prob_global = probs[1]
+                sparsity_loss += prob_global
+                router_count += 1
 
             if router_count > 0:
                 sparsity_loss = sparsity_loss / router_count  # 取所有层的平均全局概率
