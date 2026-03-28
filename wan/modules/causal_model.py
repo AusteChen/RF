@@ -125,11 +125,12 @@ class LayerTypeClassifier(nn.Module):
     def __init__(self, init_global: bool = True, init_scale: float = 2.0):
         super().__init__()
         init_value = init_scale if init_global else -init_scale
+        self.init_value = float(init_value)
         self.global_logit = nn.Parameter(torch.tensor(float(init_value)))
 
     def reset_parameters(self):
         with torch.no_grad():
-            self.global_logit.zero_()
+            self.global_logit.fill_(self.init_value)
 
     def forward(self) -> torch.Tensor:
         return torch.sigmoid(self.global_logit)
@@ -985,6 +986,31 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def reset_parameters(self):
+        """为 FSDP meta materialization 提供完整初始化入口。"""
+        self.init_weights()
+
+        for block in self.blocks:
+            if hasattr(block, "reset_parameters"):
+                block.reset_parameters()
+
+        if self.layer_classifiers is not None:
+            for classifier in self.layer_classifiers:
+                if hasattr(classifier, "reset_parameters"):
+                    classifier.reset_parameters()
+
+        if hasattr(self.head, "reset_parameters"):
+            self.head.reset_parameters()
+
+        if hasattr(self, "img_emb") and hasattr(self.img_emb, "reset_parameters"):
+            self.img_emb.reset_parameters()
+
+        self.reset_stream_state()
+        self.latest_layer_global_probs = None
+        self.block_mask = None
+        if hasattr(self, "_cached_lookahead"):
+            self._cached_lookahead = None
 
     def reset_stream_state(self):
         """重置流式推理相关的动态状态（动态锚点等）。"""
