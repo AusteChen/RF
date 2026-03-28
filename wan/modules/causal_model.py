@@ -125,11 +125,12 @@ class LayerTypeClassifier(nn.Module):
     def __init__(self, init_global: bool = True, init_scale: float = 2.0):
         super().__init__()
         init_value = init_scale if init_global else -init_scale
+        self.init_value = float(init_value)
         self.global_logit = nn.Parameter(torch.tensor(float(init_value)))
 
     def reset_parameters(self):
         with torch.no_grad():
-            self.global_logit.zero_()
+            self.global_logit.fill_(self.init_value)
 
     def forward(self) -> torch.Tensor:
         return torch.sigmoid(self.global_logit)
@@ -139,148 +140,133 @@ class DynamicAnchorHead(nn.Module):
     """
     动态锚点提取头 (流式生成专用)
 
-    用当前 block 的 block-level 摘要更新一个很小的 anchor token 集合。
-    所有层都能访问这组 anchor，以弥补局部层裁剪远历史后的全局稳定参考缺失。
+    保持 RF 原始锚点表示不变：锚点始终是一个真实的完整 block。
+    与原始 RF 唯一的区别是：这个 block 不再固定为首 block，而是可以在检测到场景变化时切换。
     """
 
     def __init__(
         self,
-        dim: int,
-        num_heads: int,
-        head_dim: int,
         anchor_blocks: int = 1,
         scene_change_tau: float = 0.6,
     ):
         super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = head_dim
         self.anchor_blocks = anchor_blocks
         self.scene_change_tau = scene_change_tau
 
         # 动态状态（不使用 Parameter，因为形状受 Batch 影响）
         self.anchor_k = None
         self.anchor_v = None
-        self.last_block_key = None
+        self.anchor_repr = None
+        self.anchor_start_frame = 0
         self.last_is_scene_change = False
         self.last_similarity = None
         self.last_anchor_length = 0
-
-        self.anchor_key_proj = nn.Linear(head_dim, head_dim, bias=False)
-        self.anchor_value_proj = nn.Linear(head_dim, head_dim, bias=False)
 
     def reset_parameters(self):
         """重置动态状态，确保与 PyTorch FSDP 兼容"""
         self.anchor_k = None
         self.anchor_v = None
-        self.last_block_key = None
+        self.anchor_repr = None
+        self.anchor_start_frame = 0
         self.last_is_scene_change = False
         self.last_similarity = None
         self.last_anchor_length = 0
 
-    def _pool_block_tokens(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        将一个 block 的所有 token 压成 1 个 block token，输出 [B, 1, N, D]。
-        """
-        return x.mean(dim=1, keepdim=True)
-
-    def _apply_proj(self, x: torch.Tensor, proj: nn.Linear) -> torch.Tensor:
-        b, t, n, d = x.shape
-        return proj(x.reshape(b * t * n, d)).reshape(b, t, n, d)
+    def _compute_block_repr(self, current_k: torch.Tensor) -> torch.Tensor:
+        return current_k.mean(dim=(1, 2))
 
     def _compute_anchor(
         self,
         current_k: torch.Tensor,
         current_v: torch.Tensor,
-        last_block_key: torch.Tensor,
+        current_start_frame: int,
+        anchor_repr: torch.Tensor,
     ) -> tuple:
         """
         用当前 block 更新动态 anchor。
         当检测到场景变化时，刷新 anchor；否则沿用已有 anchor。
         """
-        current_block_repr = current_k.mean(dim=2).squeeze(1)
+        current_block_repr = self._compute_block_repr(current_k)
 
-        if last_block_key is not None:
+        if anchor_repr is not None:
             current_norm = F.normalize(current_block_repr, dim=-1)
-            last_norm = F.normalize(last_block_key, dim=-1)
+            last_norm = F.normalize(anchor_repr, dim=-1)
             similarity = (current_norm * last_norm).sum(dim=-1).mean().item()
             is_scene_change = similarity < self.scene_change_tau
         else:
             similarity = None
             is_scene_change = True
 
-        new_anchor_k = self._apply_proj(current_k, self.anchor_key_proj)
-        new_anchor_v = self._apply_proj(current_v, self.anchor_value_proj)
+        new_anchor_k = current_k
+        new_anchor_v = current_v
 
-        return new_anchor_k, new_anchor_v, current_block_repr.detach(), is_scene_change, similarity
+        return (
+            new_anchor_k,
+            new_anchor_v,
+            current_block_repr.detach(),
+            current_start_frame,
+            is_scene_change,
+            similarity,
+        )
 
-    def _merge_anchor_queue(
+    def _select_anchor(
         self,
-        prev_anchor: torch.Tensor,
-        new_anchor: torch.Tensor,
+        current_anchor_k: torch.Tensor,
+        current_anchor_v: torch.Tensor,
+        current_repr: torch.Tensor,
+        current_start_frame: int,
         is_scene_change: bool,
-    ) -> torch.Tensor:
-        if new_anchor is None:
-            return prev_anchor
-        if prev_anchor is None or is_scene_change:
-            return new_anchor
-        merged_anchor = torch.cat([prev_anchor, new_anchor], dim=1)
-        return merged_anchor[:, -self.anchor_blocks:]
+    ) -> tuple:
+        if self.anchor_k is None or is_scene_change:
+            return current_anchor_k, current_anchor_v, current_repr, current_start_frame
+        return self.anchor_k, self.anchor_v, self.anchor_repr, self.anchor_start_frame
 
     def forward(
         self,
         current_k: torch.Tensor,
         current_v: torch.Tensor,
-        last_block_key: torch.Tensor = None,
-        anchor_k: torch.Tensor = None,
-        anchor_v: torch.Tensor = None,
+        current_start_frame: int,
         update_state: bool = True,
     ) -> dict:
         output = {
             'anchor_k': None,
             'anchor_v': None,
             'is_scene_change': False,
-            'last_block_key_out': last_block_key,
-            'anchor_k_out': anchor_k,
-            'anchor_v_out': anchor_v,
+            'anchor_start_frame': 0,
         }
 
-        if last_block_key is None:
-            last_block_key = self.last_block_key
-        if anchor_k is None:
-            anchor_k = self.anchor_k
-        if anchor_v is None:
-            anchor_v = self.anchor_v
-
-        current_block_k = self._pool_block_tokens(current_k)
-        current_block_v = self._pool_block_tokens(current_v)
-
-        current_anchor_k, current_anchor_v, last_block_key_out, is_scene_change, similarity = self._compute_anchor(
-            current_block_k,
-            current_block_v,
-            last_block_key,
+        current_anchor_k, current_anchor_v, current_repr, anchor_start_frame, is_scene_change, similarity = self._compute_anchor(
+            current_k,
+            current_v,
+            current_start_frame,
+            self.anchor_repr,
         )
         output['is_scene_change'] = is_scene_change
 
-        next_anchor_k = self._merge_anchor_queue(anchor_k, current_anchor_k, is_scene_change)
-        next_anchor_v = self._merge_anchor_queue(anchor_v, current_anchor_v, is_scene_change)
+        next_anchor_k, next_anchor_v, next_anchor_repr, next_anchor_start_frame = self._select_anchor(
+            current_anchor_k,
+            current_anchor_v,
+            current_repr,
+            anchor_start_frame,
+            is_scene_change,
+        )
 
         if update_state:
             self.anchor_k = next_anchor_k.detach() if next_anchor_k is not None else None
             self.anchor_v = next_anchor_v.detach() if next_anchor_v is not None else None
+            self.anchor_repr = next_anchor_repr
+            self.anchor_start_frame = int(next_anchor_start_frame)
             output['anchor_k'] = next_anchor_k
             output['anchor_v'] = next_anchor_v
-            self.last_block_key = last_block_key_out
+            output['anchor_start_frame'] = self.anchor_start_frame
         else:
             output['anchor_k'] = next_anchor_k
             output['anchor_v'] = next_anchor_v
-            output['anchor_k_out'] = next_anchor_k.detach() if next_anchor_k is not None else None
-            output['anchor_v_out'] = next_anchor_v.detach() if next_anchor_v is not None else None
-            output['last_block_key_out'] = last_block_key_out
+            output['anchor_start_frame'] = int(next_anchor_start_frame)
 
         self.last_is_scene_change = bool(is_scene_change)
         self.last_similarity = similarity
-        self.last_anchor_length = 0 if next_anchor_k is None else int(next_anchor_k.shape[1])
+        self.last_anchor_length = 0 if next_anchor_k is None else self.anchor_blocks
 
         return output
 
@@ -288,7 +274,8 @@ class DynamicAnchorHead(nn.Module):
         """重置动态状态"""
         self.anchor_k = None
         self.anchor_v = None
-        self.last_block_key = None
+        self.anchor_repr = None
+        self.anchor_start_frame = 0
         self.last_is_scene_change = False
         self.last_similarity = None
         self.last_anchor_length = 0
@@ -337,6 +324,7 @@ class CausalWanSelfAttention(nn.Module):
         updating_cache=False,
         anchor_k=None,  # [B, S_anchor, N, D] 动态锚点，所有层可见
         anchor_v=None,
+        anchor_start_frame=0,
         is_global_layer=True,
         local_history_blocks=2,
         global_prob=None,
@@ -536,7 +524,13 @@ class CausalWanSelfAttention(nn.Module):
                         key_parts = []
                         value_parts = []
                         if anchor_k is not None and anchor_v is not None:
-                            key_parts.append(anchor_k)
+                            dynamic_anchor_key = causal_rope_apply(
+                                anchor_k,
+                                grid_sizes_one_block,
+                                freqs,
+                                start_frame=anchor_start_frame,
+                            ).type_as(v)
+                            key_parts.append(dynamic_anchor_key)
                             value_parts.append(anchor_v)
                         else:
                             key_parts.append(anchor_cache_key)
@@ -601,11 +595,7 @@ class CausalWanAttentionBlock(nn.Module):
         self.last_global_prob = None
 
         if use_dynamic_anchor:
-            head_dim = dim // num_heads
             self.dynamic_anchor_head = DynamicAnchorHead(
-                dim=dim,
-                num_heads=num_heads,
-                head_dim=head_dim,
                 anchor_blocks=anchor_blocks,
                 scene_change_tau=scene_change_tau,
             )
@@ -675,10 +665,12 @@ class CausalWanAttentionBlock(nn.Module):
             self.last_global_prob = 1.0 if is_global_bool else 0.0
 
         anchor_k, anchor_v = None, None
+        anchor_start_frame = 0
         if self.dynamic_anchor_head is not None and kv_cache is not None:
             if updating_cache:
                 b, s_total = x.shape[:2]
                 n, d = self.num_heads, self.dim // self.num_heads
+                current_start_frame = current_start // frame_seqlen
                 normed_x = (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen))
                             * (1 + e[1]) + e[0]).flatten(1, 2)
                 curr_k = self.self_attn.norm_k(self.self_attn.k(normed_x)).view(b, s_total, n, d)[:, :self.self_attn.block_length]
@@ -687,13 +679,16 @@ class CausalWanAttentionBlock(nn.Module):
                 head_out = self.dynamic_anchor_head(
                     current_k=curr_k,
                     current_v=curr_v,
+                    current_start_frame=current_start_frame,
                     update_state=True,
                 )
                 anchor_k = head_out["anchor_k"]
                 anchor_v = head_out["anchor_v"]
+                anchor_start_frame = head_out["anchor_start_frame"]
             else:
                 anchor_k = self.dynamic_anchor_head.anchor_k
                 anchor_v = self.dynamic_anchor_head.anchor_v
+                anchor_start_frame = self.dynamic_anchor_head.anchor_start_frame
 
         y = self.self_attn(
             (self.norm1(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]).flatten(1, 2),
@@ -702,6 +697,7 @@ class CausalWanAttentionBlock(nn.Module):
             updating_cache=updating_cache,
             anchor_k=anchor_k,
             anchor_v=anchor_v,
+            anchor_start_frame=anchor_start_frame,
             is_global_layer=is_global_bool,
             local_history_blocks=self.local_history_blocks,
             global_prob=global_prob,
@@ -985,6 +981,31 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
+
+    def reset_parameters(self):
+        """为 FSDP meta materialization 提供完整初始化入口。"""
+        self.init_weights()
+
+        for block in self.blocks:
+            if hasattr(block, "reset_parameters"):
+                block.reset_parameters()
+
+        if self.layer_classifiers is not None:
+            for classifier in self.layer_classifiers:
+                if hasattr(classifier, "reset_parameters"):
+                    classifier.reset_parameters()
+
+        if hasattr(self.head, "reset_parameters"):
+            self.head.reset_parameters()
+
+        if hasattr(self, "img_emb") and hasattr(self.img_emb, "reset_parameters"):
+            self.img_emb.reset_parameters()
+
+        self.reset_stream_state()
+        self.latest_layer_global_probs = None
+        self.block_mask = None
+        if hasattr(self, "_cached_lookahead"):
+            self._cached_lookahead = None
 
     def reset_stream_state(self):
         """重置流式推理相关的动态状态（动态锚点等）。"""
